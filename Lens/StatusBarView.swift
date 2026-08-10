@@ -1,0 +1,29 @@
+import SwiftUI
+
+struct StatusBarView: View {
+    @Environment(LensModel.self) private var model
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Text("\(model.captures.filteredFlows.count)/\(model.captures.flows.count) flows")
+            Text(ByteCountFormatter.string(fromByteCount: Int64(model.captures.flows.reduce(0) { $0 + $1.size }), countStyle: .file))
+            Spacer()
+            statusChip("Map Local", active: !model.mappings.rules.isEmpty)
+            statusChip("Capture Paused", active: model.captures.isCapturePaused)
+            statusChip("Device Attached", active: model.devices.devices.contains(where: \.isAttached))
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+        .background(.bar)
+    }
+
+    private func statusChip(_ text: String, active: Bool) -> some View {
+        Text(text)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(active ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.12), in: Capsule())
+            .foregroundStyle(active ? Color.primary : Color.secondary)
+    }
+}

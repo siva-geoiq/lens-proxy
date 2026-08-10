@@ -1,0 +1,153 @@
+import Darwin
+import Foundation
+
+final class EngineProcessManager: @unchecked Sendable {
+    private var process: Process?
+    private var outputPipe: Pipe?
+    private var errorPipe: Pipe?
+    private let outputQueue = DispatchQueue(label: "com.lenskart.lens.engine-output")
+    private var outputBuffer = ""
+
+    var isRunning: Bool { process?.isRunning == true }
+
+    func start(
+        proxyPort: Int,
+        onControlPort: @escaping @Sendable (UInt16) -> Void,
+        onLog: @escaping @Sendable (String) -> Void,
+        onExit: @escaping @Sendable (Int32) -> Void
+    ) throws -> String {
+        guard process?.isRunning != true else { throw EngineProcessError.alreadyRunning }
+        guard isPortAvailable(proxyPort) else { throw EngineProcessError.portInUse(proxyPort) }
+        guard let executable = locateMitmdump() else { throw EngineProcessError.mitmdumpNotFound }
+        guard let addonURL = Bundle.main.url(forResource: "lens_addon", withExtension: "py") else {
+            throw EngineProcessError.addonNotFound
+        }
+
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let process = Process()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.executableURL = executable
+        process.arguments = [
+            "--listen-host", "0.0.0.0",
+            "--listen-port", String(proxyPort),
+            "--set", "block_global=false",
+            "--set", "websocket=true",
+            "--scripts", addonURL.path
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["LENS_CONTROL_TOKEN"] = token
+        process.environment = environment
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        process.terminationHandler = { [weak self] terminatedProcess in
+            guard let self, self.process === terminatedProcess else { return }
+            self.process = nil
+            self.outputPipe = nil
+            self.errorPipe = nil
+            onExit(terminatedProcess.terminationStatus)
+        }
+
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            self?.processOutput(text, onControlPort: onControlPort, onLog: onLog)
+        }
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            onLog(text)
+        }
+
+        try process.run()
+        self.process = process
+        self.outputPipe = outputPipe
+        self.errorPipe = errorPipe
+        return token
+    }
+
+    func stop() {
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        errorPipe?.fileHandleForReading.readabilityHandler = nil
+        let runningProcess = process
+        process = nil
+        outputPipe = nil
+        errorPipe = nil
+        if runningProcess?.isRunning == true { runningProcess?.interrupt() }
+    }
+
+    private func processOutput(
+        _ text: String,
+        onControlPort: @escaping @Sendable (UInt16) -> Void,
+        onLog: @escaping @Sendable (String) -> Void
+    ) {
+        outputQueue.async { [weak self] in
+            guard let self else { return }
+            outputBuffer += text
+            let parts = outputBuffer.components(separatedBy: .newlines)
+            outputBuffer = parts.last ?? ""
+            for line in parts.dropLast() {
+                if line.hasPrefix("LENS_CONTROL_PORT="),
+                   let port = UInt16(line.replacingOccurrences(of: "LENS_CONTROL_PORT=", with: "")) {
+                    onControlPort(port)
+                } else if !line.isEmpty {
+                    onLog(line)
+                }
+            }
+        }
+    }
+
+    private func locateMitmdump() -> URL? {
+        let candidates = [
+            UserDefaults.standard.string(forKey: "mitmdumpPath"),
+            "/opt/homebrew/bin/mitmdump",
+            "/usr/local/bin/mitmdump"
+        ].compactMap { $0 }
+        return candidates
+            .map(URL.init(fileURLWithPath:))
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private func isPortAvailable(_ port: Int) -> Bool {
+        guard (1...65_535).contains(port) else { return false }
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        var reuseAddress: Int32 = 1
+        guard setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuseAddress,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else { return false }
+        var address = sockaddr_in(
+            sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
+            sin_family: sa_family_t(AF_INET),
+            sin_port: in_port_t(port).bigEndian,
+            sin_addr: in_addr(s_addr: INADDR_ANY),
+            sin_zero: (0, 0, 0, 0, 0, 0, 0, 0)
+        )
+        return withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+    }
+}
+
+enum EngineProcessError: LocalizedError {
+    case alreadyRunning
+    case mitmdumpNotFound
+    case addonNotFound
+    case portInUse(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .alreadyRunning: "mitmdump is already running."
+        case .mitmdumpNotFound: "mitmdump was not found. Install mitmproxy with Homebrew or select its path in Settings."
+        case .addonNotFound: "The Lens mitmproxy addon is missing from the application bundle."
+        case let .portInUse(port): "Port \(port) is already in use. Stop the conflicting proxy or select another port in Settings."
+        }
+    }
+}

@@ -1,0 +1,287 @@
+import asyncio
+import base64
+import json
+import os
+import time
+import urllib.parse
+from pathlib import Path
+
+from mitmproxy import ctx, http, io, version
+
+
+PROTOCOL_VERSION = 1
+MAX_BODY_BYTES = 10 * 1024 * 1024
+
+
+class LensAddon:
+    def __init__(self):
+        self.token = os.environ.get("LENS_CONTROL_TOKEN", "")
+        self.clients = set()
+        self.capture_enabled = True
+        self.mappings = []
+        self.flows = {}
+        self.events = asyncio.Queue(maxsize=1000)
+        self.server = None
+        self.broadcast_task = None
+
+    async def running(self):
+        self.server = await asyncio.start_server(self.handle_client, "127.0.0.1", 0)
+        port = self.server.sockets[0].getsockname()[1]
+        print(f"LENS_CONTROL_PORT={port}", flush=True)
+        self.broadcast_task = asyncio.create_task(self.broadcast_events())
+
+    async def done(self):
+        if self.broadcast_task:
+            self.broadcast_task.cancel()
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+
+    def request(self, flow: http.HTTPFlow):
+        self.apply_mapping(flow)
+        self.flows[flow.id] = flow
+        self.emit_flow(flow)
+
+    def response(self, flow: http.HTTPFlow):
+        self.flows[flow.id] = flow
+        self.emit_flow(flow)
+
+    def error(self, flow: http.HTTPFlow):
+        self.flows[flow.id] = flow
+        self.emit_flow(flow)
+
+    def websocket_message(self, flow: http.HTTPFlow):
+        self.flows[flow.id] = flow
+        self.emit_flow(flow)
+
+    async def handle_client(self, reader, writer):
+        await self.write(writer, "hello", {
+            "engine": "mitmproxy",
+            "mitmproxyVersion": version.VERSION,
+            "protocolVersion": PROTOCOL_VERSION,
+        })
+        authenticated = False
+        try:
+            while not reader.at_eof():
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError as error:
+                    await self.write_error(writer, "invalid_json", str(error))
+                    continue
+                if message.get("protocolVersion") != PROTOCOL_VERSION:
+                    await self.write_error(writer, "protocol_mismatch", "Unsupported Lens bridge protocol.")
+                    continue
+                message_type = message.get("type")
+                payload = message.get("payload") or {}
+                if not authenticated:
+                    if message_type != "authenticate" or payload.get("token") != self.token:
+                        await self.write_error(writer, "unauthorized", "Invalid Lens bridge token.")
+                        break
+                    authenticated = True
+                    self.clients.add(writer)
+                    await self.write(writer, "authenticated", {"captureEnabled": self.capture_enabled})
+                    continue
+                await self.handle_command(writer, message_type, payload, message.get("requestID"))
+        finally:
+            self.clients.discard(writer)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def handle_command(self, writer, message_type, payload, request_id):
+        try:
+            if message_type == "setMappings":
+                self.mappings = sorted(payload.get("rules", []), key=lambda rule: rule.get("order", 0))
+                await self.write(writer, "mappingsUpdated", {"count": len(self.mappings)}, request_id)
+            elif message_type == "setCaptureEnabled":
+                self.capture_enabled = bool(payload.get("enabled", True))
+                await self.write(writer, "captureState", {"enabled": self.capture_enabled}, request_id)
+            elif message_type == "clearFlows":
+                self.flows.clear()
+                await self.write(writer, "sessionReset", {}, request_id)
+            elif message_type == "saveSession":
+                self.save_session(payload.get("path", ""))
+                await self.write(writer, "sessionSaved", {"path": payload.get("path")}, request_id)
+            elif message_type == "openSession":
+                loaded = self.open_session(payload.get("path", ""))
+                await self.write(writer, "sessionReset", {}, request_id)
+                for flow in loaded:
+                    await self.events.put(self.envelope("flowUpsert", self.serialize_flow(flow)))
+            elif message_type == "shutdown":
+                await self.write(writer, "shuttingDown", {}, request_id)
+                ctx.master.shutdown()
+            else:
+                await self.write_error(writer, "unknown_command", f"Unknown command: {message_type}", request_id)
+        except Exception as error:
+            await self.write_error(writer, "command_failed", str(error), request_id)
+
+    def apply_mapping(self, flow: http.HTTPFlow):
+        request = flow.request
+        split = urllib.parse.urlsplit(request.pretty_url)
+        request_port = request.port or (443 if request.scheme == "https" else 80)
+        for rule in self.mappings:
+            if not rule.get("enabled", True):
+                continue
+            if rule.get("method", "").upper() != request.method.upper():
+                continue
+            if rule.get("scheme", "").lower() != request.scheme.lower():
+                continue
+            if rule.get("host", "").lower() != request.host.lower():
+                continue
+            if int(rule.get("port", request_port)) != request_port:
+                continue
+            if rule.get("path", "/") != split.path:
+                continue
+            if rule.get("matchQuery", False) and (rule.get("query") or "") != (split.query or ""):
+                continue
+            body = rule.get("responseBody") or {}
+            body_data = base64.b64decode(body.get("data", ""))
+            headers = http.Headers([
+                (item.get("name", "").encode("latin-1"), item.get("value", "").encode("latin-1"))
+                for item in rule.get("responseHeaders", [])
+                if item.get("name")
+            ])
+            flow.response = http.Response.make(int(rule.get("statusCode", 200)), body_data, headers)
+            flow.metadata["lens_mapping_id"] = rule.get("id")
+            flow.metadata["lens_mapping_name"] = rule.get("name")
+            break
+
+    def emit_flow(self, flow):
+        if not self.capture_enabled:
+            return
+        event = self.envelope("flowUpsert", self.serialize_flow(flow))
+        if self.events.full():
+            try:
+                self.events.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        self.events.put_nowait(event)
+
+    async def broadcast_events(self):
+        while True:
+            event = await self.events.get()
+            data = (json.dumps(event, separators=(",", ":")) + "\n").encode()
+            failed = []
+            for writer in list(self.clients):
+                try:
+                    writer.write(data)
+                    await writer.drain()
+                except Exception:
+                    failed.append(writer)
+            for writer in failed:
+                self.clients.discard(writer)
+
+    def serialize_flow(self, flow: http.HTTPFlow):
+        request = flow.request
+        response = flow.response
+        peer = flow.client_conn.peername
+        ended_at = response.timestamp_end if response else None
+        duration = ended_at - request.timestamp_start if ended_at else None
+        websocket_messages = []
+        if flow.websocket:
+            for index, message in enumerate(flow.websocket.messages):
+                content = message.content
+                websocket_messages.append({
+                    "id": f"{flow.id}-{index}",
+                    "fromClient": message.from_client,
+                    "isText": message.is_text,
+                    "content": content.decode("utf-8", errors="replace") if message.is_text and isinstance(content, bytes)
+                    else content if isinstance(content, str)
+                    else base64.b64encode(content).decode(),
+                    "timestamp": message.timestamp,
+                })
+        return {
+            "id": flow.id,
+            "clientAddress": peer[0] if peer else "Unknown",
+            "method": request.method,
+            "scheme": request.scheme,
+            "host": request.host,
+            "port": request.port or (443 if request.scheme == "https" else 80),
+            "path": request.path,
+            "url": request.pretty_url,
+            "requestHeaders": self.serialize_headers(request.headers),
+            "requestBody": self.serialize_body(request, request.headers),
+            "responseStatus": response.status_code if response else None,
+            "responseReason": response.reason if response else None,
+            "responseHeaders": self.serialize_headers(response.headers) if response else [],
+            "responseBody": self.serialize_body(response, response.headers) if response else None,
+            "startedAt": request.timestamp_start,
+            "endedAt": ended_at,
+            "duration": duration,
+            "size": len(response.raw_content or b"") if response else 0,
+            "mappedRuleID": flow.metadata.get("lens_mapping_id"),
+            "mappedRuleName": flow.metadata.get("lens_mapping_name"),
+            "error": flow.error.msg if flow.error else None,
+            "websocketMessages": websocket_messages,
+        }
+
+    def serialize_headers(self, headers):
+        return [{"name": name, "value": value} for name, value in headers.items(multi=True)]
+
+    def serialize_body(self, message, headers):
+        try:
+            data = message.get_content(strict=False) or b""
+        except Exception:
+            data = message.raw_content or b""
+        truncated = len(data) > MAX_BODY_BYTES
+        data = data[:MAX_BODY_BYTES]
+        content_type = headers.get("content-type", "")
+        lowered = content_type.lower()
+        is_text = any(value in lowered for value in ("json", "text", "xml", "javascript", "form"))
+        if not is_text:
+            try:
+                data.decode("utf-8")
+                is_text = True
+            except UnicodeDecodeError:
+                pass
+        return {
+            "data": base64.b64encode(data).decode(),
+            "isText": is_text,
+            "truncated": truncated,
+            "mimeType": content_type or None,
+        }
+
+    def save_session(self, path):
+        if not path:
+            raise ValueError("A session path is required.")
+        with open(path, "wb") as stream:
+            writer = io.FlowWriter(stream)
+            for flow in self.flows.values():
+                writer.add(flow)
+
+    def open_session(self, path):
+        if not path or not Path(path).exists():
+            raise ValueError("The selected session does not exist.")
+        loaded = []
+        with open(path, "rb") as stream:
+            for flow in io.FlowReader(stream).stream():
+                if isinstance(flow, http.HTTPFlow):
+                    self.flows[flow.id] = flow
+                    loaded.append(flow)
+        return loaded
+
+    def envelope(self, message_type, payload, request_id=None, error=None):
+        return {
+            "protocolVersion": PROTOCOL_VERSION,
+            "requestID": request_id,
+            "type": message_type,
+            "payload": payload,
+            "error": error,
+        }
+
+    async def write(self, writer, message_type, payload, request_id=None):
+        writer.write((json.dumps(self.envelope(message_type, payload, request_id)) + "\n").encode())
+        await writer.drain()
+
+    async def write_error(self, writer, code, message, request_id=None):
+        payload = self.envelope("engineError", None, request_id, {"code": code, "message": message})
+        writer.write((json.dumps(payload) + "\n").encode())
+        await writer.drain()
+
+
+addons = [LensAddon()]
