@@ -68,31 +68,28 @@ struct SidebarView: View {
         }
     }
 
+    @ViewBuilder
     private func deviceSection(_ device: DeviceTarget, captures: CaptureStore) -> some View {
         let deviceFlows = captures.flows(forDeviceID: device.serial)
-        return DisclosureGroup(
-            isExpanded: Binding(
-                get: { expandedDeviceIDs.contains(device.serial) },
-                set: { isExpanded in
-                    if isExpanded { expandedDeviceIDs.insert(device.serial) }
-                    else { expandedDeviceIDs.remove(device.serial) }
-                }
-            )
-        ) {
-            HStack {
-                Label("All hosts", systemImage: "network")
-                Spacer()
-                Text("\(deviceFlows.count)").foregroundStyle(.secondary)
-            }
-            .tag(CaptureScope.device(device.serial))
-            ForEach(filteredHosts(captures.hosts(forDeviceID: device.serial)), id: \.name) { host in
-                hostRow(host)
-                    .tag(CaptureScope.host(deviceID: device.serial, name: host.name))
+        let isExpanded = expandedDeviceIDs.contains(device.serial)
+
+        Button {
+            withAnimation(.snappy(duration: 0.18)) {
+                if isExpanded { expandedDeviceIDs.remove(device.serial) }
+                else { expandedDeviceIDs.insert(device.serial) }
             }
         } label: {
-            HStack {
+            HStack(alignment: .center, spacing: 8) {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .frame(width: 10)
+                    .accessibilityHidden(true)
                 Image(systemName: device.kind == .emulator ? "apps.iphone" : "iphone")
                     .foregroundStyle(deviceFlows.isEmpty ? Color.secondary : Color.blue)
+                    .frame(width: 18)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(device.model).lineLimit(1)
                     Text(device.serial)
@@ -103,7 +100,30 @@ struct SidebarView: View {
                 if !deviceFlows.isEmpty {
                     Text("\(deviceFlows.count)")
                         .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
+            }
+            .padding(.leading, 8)
+            .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(device.model), \(device.serial)")
+        .accessibilityValue("\(deviceFlows.count) requests, \(isExpanded ? "expanded" : "collapsed")")
+        .help(isExpanded ? "Collapse device hosts" : "Expand device hosts")
+
+        if isExpanded {
+            HStack {
+                Label("All hosts", systemImage: "network")
+                Spacer()
+                Text("\(deviceFlows.count)").foregroundStyle(.secondary)
+            }
+            .padding(.leading, 36)
+            .tag(CaptureScope.device(device.serial))
+            ForEach(filteredHosts(captures.hosts(forDeviceID: device.serial)), id: \.name) { host in
+                hostRow(host)
+                    .padding(.leading, 36)
+                    .tag(CaptureScope.host(deviceID: device.serial, name: host.name))
             }
         }
     }
