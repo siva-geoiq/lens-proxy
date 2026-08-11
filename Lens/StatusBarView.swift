@@ -9,8 +9,9 @@ struct StatusBarView: View {
             Text(ByteCountFormatter.string(fromByteCount: Int64(model.captures.flows.reduce(0) { $0 + $1.size }), countStyle: .file))
             Spacer()
             statusChip("Map Local", active: !model.mappings.rules.isEmpty)
+            statusChip("No Caching", active: model.isNoCachingEnabled)
             statusChip("Capture Paused", active: model.captures.isCapturePaused)
-            statusChip("Device Attached", active: model.devices.devices.contains(where: \.isAttached))
+            statusChip(deviceStatusText, active: model.devices.devices.contains(where: \.isAttached))
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -25,5 +26,11 @@ struct StatusBarView: View {
             .padding(.vertical, 3)
             .background(active ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.12), in: Capsule())
             .foregroundStyle(active ? Color.primary : Color.secondary)
+    }
+
+    private var deviceStatusText: String {
+        if model.attachingDeviceID != nil { return "Attaching Device" }
+        if model.devices.devices.contains(where: \.isAttached) { return "Device Attached" }
+        return "Device Detached"
     }
 }

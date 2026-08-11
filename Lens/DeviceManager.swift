@@ -9,7 +9,7 @@ struct CommandResult: Sendable {
 }
 
 final class CommandRunner: @unchecked Sendable {
-    func run(_ executable: URL, arguments: [String]) async throws -> CommandResult {
+    func run(_ executable: URL, arguments: [String], timeout: TimeInterval? = nil) async throws -> CommandResult {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
@@ -21,7 +21,27 @@ final class CommandRunner: @unchecked Sendable {
                 process.standardError = error
                 do {
                     try process.run()
-                    process.waitUntilExit()
+                    if let timeout {
+                        let deadline = Date().addingTimeInterval(timeout)
+                        while process.isRunning && Date() < deadline {
+                            Thread.sleep(forTimeInterval: 0.01)
+                        }
+                        if process.isRunning {
+                            process.terminate()
+                            let terminationDeadline = Date().addingTimeInterval(0.5)
+                            while process.isRunning && Date() < terminationDeadline {
+                                Thread.sleep(forTimeInterval: 0.01)
+                            }
+                            if process.isRunning {
+                                kill(process.processIdentifier, SIGKILL)
+                                process.waitUntilExit()
+                            }
+                            continuation.resume(throwing: CommandRunnerError.timedOut(executable.lastPathComponent, timeout))
+                            return
+                        }
+                    } else {
+                        process.waitUntilExit()
+                    }
                     let outputData = output.fileHandleForReading.readDataToEndOfFile()
                     let errorData = error.fileHandleForReading.readDataToEndOfFile()
                     continuation.resume(
@@ -48,12 +68,28 @@ final class DeviceManager {
     var adbPath: String?
 
     private let runner = CommandRunner()
+    private let preferences: DeviceAttachmentPreferences
+    private let defaults: UserDefaults
     private var attachedSnapshots: [String: ProxySnapshot] = [:]
     private var overlaySerials = Set<String>()
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        preferences = DeviceAttachmentPreferences(defaults: defaults)
         adbPath = locateADB()?.path
         loadSnapshots()
+    }
+
+    var lastAttachedEmulatorSerial: String? {
+        preferences.lastEmulatorSerial
+    }
+
+    var preferredDetachedDevice: DeviceTarget? {
+        if let serial = preferences.lastEmulatorSerial,
+           let remembered = devices.first(where: { $0.serial == serial && !$0.isAttached }) {
+            return remembered
+        }
+        return devices.first { $0.kind == .emulator && !$0.isAttached }
     }
 
     func refresh() async {
@@ -143,9 +179,12 @@ final class DeviceManager {
             $0.rootState = rootAvailable ? .available : .unavailable
             $0.caInstalled = rootAvailable
         }
+        if target.kind == .emulator {
+            preferences.remember(emulatorSerial: target.serial)
+        }
     }
 
-    func detach(_ target: DeviceTarget) async throws {
+    func detach(_ target: DeviceTarget, forgetRememberedDevice: Bool = true) async throws {
         let snapshot = attachedSnapshots[target.serial] ?? target.previousProxy
         if let host = snapshot?.host, let port = snapshot?.port {
             _ = try await shell(target.serial, ["settings", "put", "global", "http_proxy", "\(host):\(port)"])
@@ -164,6 +203,20 @@ final class DeviceManager {
             $0.previousProxy = nil
             $0.caInstalled = false
         }
+        if forgetRememberedDevice, target.kind == .emulator {
+            preferences.forget(emulatorSerial: target.serial)
+        }
+    }
+
+    @discardableResult
+    func autoAttachLastEmulator(proxyPort: Int) async throws -> Bool {
+        guard let serial = preferences.lastEmulatorSerial,
+              let target = devices.first(where: { $0.serial == serial && $0.kind == .emulator }) else {
+            return false
+        }
+        guard !target.isAttached else { return true }
+        try await attach(target, proxyPort: proxyPort)
+        return true
     }
 
     func restoreAttachedDevices() {
@@ -171,7 +224,9 @@ final class DeviceManager {
     }
 
     func restoreAttachedDevicesAndWait() async {
-        for target in devices.filter(\.isAttached) { try? await detach(target) }
+        for target in devices.filter(\.isAttached) {
+            try? await detach(target, forgetRememberedDevice: false)
+        }
     }
 
     func recoverPreviousAttachments() async {
@@ -182,8 +237,14 @@ final class DeviceManager {
 
     func useADB(at path: String?) {
         adbPath = path
-        UserDefaults.standard.set(path, forKey: "adbPath")
+        defaults.set(path, forKey: "adbPath")
     }
+
+#if DEBUG
+    func prepareUITestDevices(_ fixtures: [DeviceTarget]) {
+        devices = fixtures
+    }
+#endif
 
     private func readProxy(_ serial: String) async throws -> ProxySnapshot {
         let output = try await shell(serial, ["settings", "get", "global", "http_proxy"])
@@ -212,17 +273,49 @@ final class DeviceManager {
         _ = try await adb(["-s", target.serial, "push", certificate.path, "/data/local/tmp/\(filename)"])
 
         if target.apiLevel >= 34 {
+            let certificateDirectory = "/apex/com.android.conscrypt/cacerts"
+            let overlayDirectory = "/data/local/tmp/lens-cacerts"
+            let markerPath = "\(overlayDirectory)/.lens-overlay"
+            _ = try await shell(target.serial, ["mkdir", "-p", overlayDirectory])
+            _ = try await shellCommand(target.serial, "cp \(certificateDirectory)/*.0 \(overlayDirectory)/ 2>/dev/null || true")
+            _ = try await shell(target.serial, ["cp", "/data/local/tmp/\(filename)", "\(overlayDirectory)/\(filename)"])
+            _ = try await shell(target.serial, ["chmod", "755", overlayDirectory])
+            _ = try await shellCommand(target.serial, "chmod 644 \(overlayDirectory)/*.0")
+            _ = try await shell(target.serial, ["touch", markerPath])
+
             let mountState = try await shell(target.serial, ["mount"])
-            if !mountState.output.contains("tmpfs on /apex/com.android.conscrypt/cacerts") {
-                _ = try await shell(target.serial, ["mkdir", "-p", "/data/local/tmp/lens-cacerts"])
-                _ = try await shellCommand(target.serial, "cp /apex/com.android.conscrypt/cacerts/*.0 /data/local/tmp/lens-cacerts/")
-                _ = try await shell(target.serial, ["mount", "-t", "tmpfs", "tmpfs", "/apex/com.android.conscrypt/cacerts"])
-                _ = try await shellCommand(target.serial, "cp /data/local/tmp/lens-cacerts/*.0 /apex/com.android.conscrypt/cacerts/")
+            if !mountState.output.contains("tmpfs on \(certificateDirectory)") {
+                _ = try await shell(target.serial, ["mount", "-t", "tmpfs", "tmpfs", certificateDirectory])
                 overlaySerials.insert(target.serial)
             }
-            _ = try await shell(target.serial, ["cp", "/data/local/tmp/\(filename)", "/apex/com.android.conscrypt/cacerts/\(filename)"])
-            _ = try await shell(target.serial, ["chmod", "644", "/apex/com.android.conscrypt/cacerts/\(filename)"])
-            _ = try await shell(target.serial, ["chcon", "u:object_r:system_file:s0", "/apex/com.android.conscrypt/cacerts/\(filename)"])
+            try await populateCertificateOverlay(
+                serial: target.serial,
+                namespacePID: nil,
+                sourceDirectory: overlayDirectory,
+                certificateDirectory: certificateDirectory,
+                filename: filename
+            )
+
+            let zygoteOutput = try await shell(target.serial, ["pidof", "zygote", "zygote64"])
+            for pid in zygoteOutput.output.split(whereSeparator: \.isWhitespace).map(String.init) {
+                let namespaceMounts = try await shell(
+                    target.serial,
+                    ["nsenter", "--mount=/proc/\(pid)/ns/mnt", "--", "mount"]
+                )
+                if !namespaceMounts.output.contains("tmpfs on \(certificateDirectory)") {
+                    _ = try await shell(
+                        target.serial,
+                        ["nsenter", "--mount=/proc/\(pid)/ns/mnt", "--", "mount", "-t", "tmpfs", "tmpfs", certificateDirectory]
+                    )
+                }
+                try await populateCertificateOverlay(
+                    serial: target.serial,
+                    namespacePID: pid,
+                    sourceDirectory: overlayDirectory,
+                    certificateDirectory: certificateDirectory,
+                    filename: filename
+                )
+            }
         } else {
             _ = try? await adb(["-s", target.serial, "remount"])
             _ = try await shell(target.serial, ["cp", "/data/local/tmp/\(filename)", "/system/etc/security/cacerts/\(filename)"])
@@ -240,11 +333,43 @@ final class DeviceManager {
         ).output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !hash.isEmpty else { return }
         _ = try? await shell(target.serial, ["rm", "-f", "/system/etc/security/cacerts/\(hash).0"])
-        _ = try? await shell(target.serial, ["rm", "-f", "/apex/com.android.conscrypt/cacerts/\(hash).0"])
         _ = try? await shell(target.serial, ["rm", "-f", "/data/local/tmp/\(hash).0"])
-        if overlaySerials.remove(target.serial) != nil {
-            _ = try? await shell(target.serial, ["umount", "/apex/com.android.conscrypt/cacerts"])
+        let certificateDirectory = "/apex/com.android.conscrypt/cacerts"
+        let overlayDirectory = "/data/local/tmp/lens-cacerts"
+        let marker = try? await shell(target.serial, ["test", "-f", "\(overlayDirectory)/.lens-overlay"])
+        if marker?.status == 0 {
+            let zygoteOutput = try? await shell(target.serial, ["pidof", "zygote", "zygote64"])
+            for pid in zygoteOutput?.output.split(whereSeparator: \.isWhitespace).map(String.init) ?? [] {
+                _ = try? await shell(
+                    target.serial,
+                    ["nsenter", "--mount=/proc/\(pid)/ns/mnt", "--", "umount", certificateDirectory]
+                )
+            }
+            _ = try? await shell(target.serial, ["umount", certificateDirectory])
+            _ = try? await shell(target.serial, ["rm", "-rf", overlayDirectory])
+            overlaySerials.remove(target.serial)
+        } else {
+            _ = try? await shell(target.serial, ["rm", "-f", "\(certificateDirectory)/\(hash).0"])
         }
+    }
+
+    private func populateCertificateOverlay(
+        serial: String,
+        namespacePID: String?,
+        sourceDirectory: String,
+        certificateDirectory: String,
+        filename: String
+    ) async throws {
+        let namespacePrefix = namespacePID.map { ["nsenter", "--mount=/proc/\($0)/ns/mnt", "--"] } ?? []
+        _ = try await shell(
+            serial,
+            namespacePrefix + ["cp", "-a", "\(sourceDirectory)/.", "\(certificateDirectory)/"]
+        )
+        _ = try await shell(serial, namespacePrefix + ["chmod", "644", "\(certificateDirectory)/\(filename)"])
+        _ = try await shell(
+            serial,
+            namespacePrefix + ["chcon", "u:object_r:system_security_cacerts_file:s0", "\(certificateDirectory)/\(filename)"]
+        )
     }
 
     private func refreshVPNState() async {
@@ -252,7 +377,7 @@ final class DeviceManager {
             activeVPNPackage = nil
             return
         }
-        guard let output = try? await shell(first.serial, ["dumpsys", "connectivity"]).output,
+        guard let output = try? await shell(first.serial, ["dumpsys", "connectivity"], timeout: 3).output,
               let range = output.range(of: "VPN:") else {
             activeVPNPackage = nil
             return
@@ -261,17 +386,17 @@ final class DeviceManager {
         activeVPNPackage = String(suffix.prefix { !$0.isWhitespace && $0 != "}" })
     }
 
-    private func shell(_ serial: String, _ arguments: [String]) async throws -> CommandResult {
-        try await adb(["-s", serial, "shell"] + arguments)
+    private func shell(_ serial: String, _ arguments: [String], timeout: TimeInterval? = nil) async throws -> CommandResult {
+        try await adb(["-s", serial, "shell"] + arguments, timeout: timeout)
     }
 
     private func shellCommand(_ serial: String, _ command: String) async throws -> CommandResult {
         try await adb(["-s", serial, "shell", command])
     }
 
-    private func adb(_ arguments: [String]) async throws -> CommandResult {
+    private func adb(_ arguments: [String], timeout: TimeInterval? = nil) async throws -> CommandResult {
         guard let adbPath else { throw DeviceManagerError.adbNotFound }
-        let result = try await runner.run(URL(fileURLWithPath: adbPath), arguments: arguments)
+        let result = try await runner.run(URL(fileURLWithPath: adbPath), arguments: arguments, timeout: timeout)
         if result.status != 0 {
             throw DeviceManagerError.commandFailed(result.errorOutput.isEmpty ? result.output : result.errorOutput)
         }
@@ -281,7 +406,7 @@ final class DeviceManager {
     private func locateADB() -> URL? {
         let environment = ProcessInfo.processInfo.environment
         let candidates = [
-            UserDefaults.standard.string(forKey: "adbPath"),
+            defaults.string(forKey: "adbPath"),
             environment["ANDROID_HOME"].map { "\($0)/platform-tools/adb" },
             environment["ANDROID_SDK_ROOT"].map { "\($0)/platform-tools/adb" },
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Android/sdk/platform-tools/adb").path,
@@ -327,13 +452,24 @@ final class DeviceManager {
     }
 
     private func loadSnapshots() {
-        guard let data = UserDefaults.standard.data(forKey: "attachedProxySnapshots"),
+        guard let data = defaults.data(forKey: "attachedProxySnapshots"),
               let snapshots = try? JSONDecoder().decode([String: ProxySnapshot].self, from: data) else { return }
         attachedSnapshots = snapshots
     }
 
     private func persistSnapshots() {
-        UserDefaults.standard.set(try? JSONEncoder().encode(attachedSnapshots), forKey: "attachedProxySnapshots")
+        defaults.set(try? JSONEncoder().encode(attachedSnapshots), forKey: "attachedProxySnapshots")
+    }
+}
+
+enum CommandRunnerError: LocalizedError {
+    case timedOut(String, TimeInterval)
+
+    var errorDescription: String? {
+        switch self {
+        case let .timedOut(command, timeout):
+            "\(command) did not finish within \(timeout.formatted()) seconds."
+        }
     }
 }
 

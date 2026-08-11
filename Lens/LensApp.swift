@@ -33,10 +33,16 @@ struct LensApp: App {
                 .environment(model)
                 .task {
                     applicationDelegate.model = model
+                    guard !isRunningUnitTests else { return }
                     if ProcessInfo.processInfo.arguments.contains("--ui-testing") {
                         model.prepareUITestFixture()
                     } else {
                         model.startEngine()
+#if DEBUG
+                        if let serial = endToEndDeviceSerial {
+                            await model.attachDeviceForEndToEndTest(serial: serial)
+                        }
+#endif
                     }
                 }
         }
@@ -52,6 +58,13 @@ struct LensApp: App {
                     .keyboardShortcut("b", modifiers: .command)
                 Button("Clear Flows") { model.clearFlows() }
                     .keyboardShortcut(.delete, modifiers: [.command, .shift])
+                Toggle(
+                    "No Caching",
+                    isOn: Binding(
+                        get: { model.isNoCachingEnabled },
+                        set: { model.setNoCaching($0) }
+                    )
+                )
                 Divider()
                 Button("Local Mappings…") { model.showingMappings = true }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
@@ -64,4 +77,18 @@ struct LensApp: App {
                 .environment(model)
         }
     }
+
+    private var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil &&
+            !ProcessInfo.processInfo.arguments.contains("--ui-testing")
+    }
+
+#if DEBUG
+    private var endToEndDeviceSerial: String? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let flagIndex = arguments.firstIndex(of: "--e2e-attach-device"),
+              arguments.indices.contains(flagIndex + 1) else { return nil }
+        return arguments[flagIndex + 1]
+    }
+#endif
 }

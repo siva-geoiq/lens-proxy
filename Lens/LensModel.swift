@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Network
 import Observation
+import OSLog
 import UniformTypeIdentifiers
 
 @MainActor
@@ -13,14 +14,21 @@ final class LensModel {
 
     private let engine: EngineProcessManager
     private let bridge: BridgeClient
-    private var bridgeToken = ""
+    private let logger = Logger(subsystem: "com.lenskart.lens.Lens", category: "Attachment")
+    private var devicePreparationTask: Task<Void, Never>?
 
     var engineState: EngineState = .stopped
     var engineLog = ""
     var lastError: String?
     var proxyPort: Int
+    var isNoCachingEnabled: Bool
     var showingMappings = false
     var showingDevices = false
+    var attachingDeviceID: String?
+
+    var detachedDevice: DeviceTarget? {
+        devices.preferredDetachedDevice
+    }
 
     init(
         captures: CaptureStore = CaptureStore(),
@@ -36,6 +44,7 @@ final class LensModel {
         self.bridge = bridge
         let storedPort = UserDefaults.standard.integer(forKey: "proxyPort")
         proxyPort = storedPort == 0 ? 8080 : storedPort
+        isNoCachingEnabled = UserDefaults.standard.bool(forKey: "noCachingEnabled")
         bridge.onEnvelope = { [weak self] envelope in
             Task { @MainActor in self?.handle(envelope) }
         }
@@ -56,18 +65,26 @@ final class LensModel {
         }
         lastError = nil
         engineState = .starting
-        Task {
-            await refreshDevices()
+        devicePreparationTask?.cancel()
+        devicePreparationTask = Task {
+            for attempt in 0..<10 {
+                await refreshDevices(autoAttachRememberedDevice: false)
+                if !devices.devices.isEmpty || Task.isCancelled { break }
+                logger.info("No Android devices found on discovery attempt \(attempt + 1); retrying")
+                try? await Task.sleep(for: .milliseconds(500))
+            }
             await devices.recoverPreviousAttachments()
             captures.attributeFlows(to: devices.devices)
+            logger.info("Device preparation completed with \(self.devices.devices.count) connected device(s)")
+            await autoAttachRememberedEmulator()
         }
         do {
-            bridgeToken = try engine.start(
+            _ = try engine.start(
                 proxyPort: proxyPort,
-                onControlPort: { [weak self] port in
+                onControlPort: { [weak self] port, token in
                     Task { @MainActor in
                         guard let self else { return }
-                        self.bridge.connect(port: port, token: self.bridgeToken)
+                        self.bridge.connect(port: port, token: token)
                     }
                 },
                 onLog: { [weak self] line in
@@ -90,8 +107,19 @@ final class LensModel {
 
     func prepareUITestFixture() {
         engineState = .running(port: proxyPort)
-        captures.upsert(
-            FlowRecord(
+        let emulator = DeviceTarget(
+            serial: "emulator-5554",
+            model: "sdk_gphone64_arm64",
+            apiLevel: 35,
+            kind: .emulator,
+            rootState: .available,
+            isAttached: false,
+            previousProxy: nil,
+            caInstalled: false,
+            networkAddresses: ["10.0.2.15"]
+        )
+        devices.prepareUITestDevices([emulator])
+        let flow = FlowRecord(
                 id: "ui-fixture-flow",
                 clientAddress: "10.0.2.15",
                 method: "POST",
@@ -114,14 +142,17 @@ final class LensModel {
                 mappedRuleName: nil,
                 error: nil,
                 websocketMessages: []
-            )
         )
+        captures.upsert(captures.attributed(flow, to: devices.devices))
         captures.selectedFlowID = "ui-fixture-flow"
     }
 
-    func refreshDevices() async {
+    func refreshDevices(autoAttachRememberedDevice: Bool = true) async {
         await devices.refresh()
         captures.attributeFlows(to: devices.devices)
+        if autoAttachRememberedDevice {
+            await autoAttachRememberedEmulator()
+        }
     }
 
     func stopEngine() {
@@ -154,6 +185,16 @@ final class LensModel {
         bridge.send(type: "setCaptureEnabled", payload: ["enabled": !captures.isCapturePaused])
     }
 
+    func setNoCaching(_ enabled: Bool) {
+        isNoCachingEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "noCachingEnabled")
+        bridge.send(type: "setNoCaching", payload: ["enabled": enabled])
+    }
+
+    func toggleNoCaching() {
+        setNoCaching(!isNoCachingEnabled)
+    }
+
     func clearFlows() {
         captures.clear()
         bridge.send(type: "clearFlows")
@@ -181,12 +222,9 @@ final class LensModel {
     }
 
     func attach(_ device: DeviceTarget, stopConflictingVPN: Bool = false) {
+        guard attachingDeviceID == nil else { return }
         Task {
-            do {
-                try await devices.attach(device, proxyPort: proxyPort, stopConflictingVPN: stopConflictingVPN)
-            } catch {
-                lastError = error.localizedDescription
-            }
+            await attachDevice(device, stopConflictingVPN: stopConflictingVPN)
         }
     }
 
@@ -204,6 +242,20 @@ final class LensModel {
         await devices.restoreAttachedDevicesAndWait()
         stopEngine()
     }
+
+#if DEBUG
+    func attachDeviceForEndToEndTest(serial: String) async {
+        for _ in 0..<100 {
+            if case .running = engineState,
+               let device = devices.devices.first(where: { $0.serial == serial }) {
+                await attachDevice(device)
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        lastError = "The end-to-end device \(serial) was not ready to attach."
+    }
+#endif
 
     private func handle(_ envelope: BridgeEnvelope) {
         if let error = envelope.error {
@@ -230,9 +282,15 @@ final class LensModel {
             case "authenticated":
                 engineState = .running(port: proxyPort)
                 sendMappings(mappings.rules)
+                bridge.send(type: "setNoCaching", payload: ["enabled": isNoCachingEnabled])
             case "flowUpsert":
                 guard let payload = envelope.payload else { return }
                 let flow = try payload.decode(FlowRecord.self)
+                let pathWithoutQuery = String(flow.path.split(separator: "?", maxSplits: 1).first ?? "")
+                let mappingName = flow.mappedRuleName ?? "none"
+                logger.info(
+                    "Captured \(flow.method, privacy: .public) \(flow.host, privacy: .public)\(pathWithoutQuery, privacy: .public) status \(flow.responseStatus ?? -1) mapping \(mappingName, privacy: .public)"
+                )
                 captures.upsert(captures.attributed(flow, to: devices.devices))
             case "sessionReset":
                 captures.clear()
@@ -241,6 +299,12 @@ final class LensModel {
                       case let .object(object) = payload,
                       case let .bool(enabled) = object["enabled"] else { return }
                 captures.isCapturePaused = !enabled
+            case "noCachingState":
+                guard let payload = envelope.payload,
+                      case let .object(object) = payload,
+                      case let .bool(enabled) = object["enabled"] else { return }
+                isNoCachingEnabled = enabled
+                UserDefaults.standard.set(enabled, forKey: "noCachingEnabled")
             case "engineError", "clientError":
                 lastError = envelope.error?.message ?? "An engine communication error occurred."
             default:
@@ -253,6 +317,47 @@ final class LensModel {
 
     private func sendMappings(_ rules: [MappingRule]) {
         bridge.send(type: "setMappings", payload: ["rules": rules])
+    }
+
+    private func autoAttachRememberedEmulator() async {
+        guard engineCanAcceptDeviceTraffic else {
+            logger.notice("Skipping auto-attach because the proxy engine is unavailable")
+            return
+        }
+        guard let serial = devices.lastAttachedEmulatorSerial else {
+            logger.info("Skipping auto-attach because no emulator is remembered")
+            return
+        }
+        guard let target = devices.devices.first(where: { $0.serial == serial && !$0.isAttached }) else {
+            logger.notice("Remembered emulator \(serial, privacy: .public) is unavailable or already attached")
+            return
+        }
+        guard attachingDeviceID == nil else {
+            logger.info("Skipping duplicate auto-attach for \(serial, privacy: .public)")
+            return
+        }
+        logger.info("Auto-attaching remembered emulator \(serial, privacy: .public)")
+        await attachDevice(target)
+    }
+
+    private var engineCanAcceptDeviceTraffic: Bool {
+        switch engineState {
+        case .starting, .running: true
+        case .stopped, .failed: false
+        }
+    }
+
+    private func attachDevice(_ device: DeviceTarget, stopConflictingVPN: Bool = false) async {
+        attachingDeviceID = device.serial
+        defer { attachingDeviceID = nil }
+        do {
+            try await devices.attach(device, proxyPort: proxyPort, stopConflictingVPN: stopConflictingVPN)
+            captures.attributeFlows(to: devices.devices)
+            logger.info("Attached \(device.serial, privacy: .public) to proxy port \(self.proxyPort)")
+        } catch {
+            logger.error("Failed to attach \(device.serial, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            lastError = error.localizedDescription
+        }
     }
 
     private func appendLog(_ line: String) {

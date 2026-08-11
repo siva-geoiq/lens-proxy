@@ -29,6 +29,14 @@ final class LensUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Save"].exists)
     }
 
+    func testDetachedDeviceBannerOffersOneClickAttach() {
+        let app = launchApplication()
+
+        XCTAssertTrue(app.staticTexts["Device detached"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["sdk_gphone64_arm64 traffic is not routed through Lens."].exists)
+        XCTAssertTrue(app.buttons["Attach"].isEnabled)
+    }
+
     private func launchApplication() -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()

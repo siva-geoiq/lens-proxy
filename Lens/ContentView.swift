@@ -10,6 +10,10 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 230, ideal: 280, max: 380)
         } detail: {
             VStack(spacing: 0) {
+                if let detachedDevice = model.detachedDevice {
+                    DeviceAttachmentBanner(device: detachedDevice)
+                    Divider()
+                }
                 FlowFilterBar()
                 Divider()
                 VSplitView {
@@ -68,6 +72,14 @@ struct ContentView: View {
             EngineStatusView()
         }
         ToolbarItemGroup(placement: .primaryAction) {
+            Button(action: model.toggleNoCaching) {
+                Label(
+                    "No Caching",
+                    systemImage: model.isNoCachingEnabled ? "externaldrive.badge.xmark.fill" : "externaldrive.badge.xmark"
+                )
+            }
+            .help(model.isNoCachingEnabled ? "Allow conditional cache requests" : "Remove conditional cache headers from requests")
+            .accessibilityLabel(model.isNoCachingEnabled ? "Disable No Caching" : "Enable No Caching")
             Button(action: model.openSession) {
                 Label("Open", systemImage: "folder")
             }

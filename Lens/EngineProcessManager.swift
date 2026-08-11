@@ -12,7 +12,7 @@ final class EngineProcessManager: @unchecked Sendable {
 
     func start(
         proxyPort: Int,
-        onControlPort: @escaping @Sendable (UInt16) -> Void,
+        onControlPort: @escaping @Sendable (UInt16, String) -> Void,
         onLog: @escaping @Sendable (String) -> Void,
         onExit: @escaping @Sendable (Int32) -> Void
     ) throws -> String {
@@ -51,7 +51,7 @@ final class EngineProcessManager: @unchecked Sendable {
         outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            self?.processOutput(text, onControlPort: onControlPort, onLog: onLog)
+            self?.processOutput(text, token: token, onControlPort: onControlPort, onLog: onLog)
         }
         errorPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -73,12 +73,22 @@ final class EngineProcessManager: @unchecked Sendable {
         process = nil
         outputPipe = nil
         errorPipe = nil
-        if runningProcess?.isRunning == true { runningProcess?.interrupt() }
+        guard let runningProcess, runningProcess.isRunning else { return }
+        runningProcess.terminate()
+        let deadline = Date().addingTimeInterval(1)
+        while runningProcess.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if runningProcess.isRunning {
+            kill(runningProcess.processIdentifier, SIGKILL)
+            runningProcess.waitUntilExit()
+        }
     }
 
     private func processOutput(
         _ text: String,
-        onControlPort: @escaping @Sendable (UInt16) -> Void,
+        token: String,
+        onControlPort: @escaping @Sendable (UInt16, String) -> Void,
         onLog: @escaping @Sendable (String) -> Void
     ) {
         outputQueue.async { [weak self] in
@@ -89,7 +99,7 @@ final class EngineProcessManager: @unchecked Sendable {
             for line in parts.dropLast() {
                 if line.hasPrefix("LENS_CONTROL_PORT="),
                    let port = UInt16(line.replacingOccurrences(of: "LENS_CONTROL_PORT=", with: "")) {
-                    onControlPort(port)
+                    onControlPort(port, token)
                 } else if !line.isEmpty {
                     onLog(line)
                 }

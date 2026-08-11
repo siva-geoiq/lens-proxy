@@ -18,6 +18,7 @@ class LensAddon:
         self.token = os.environ.get("LENS_CONTROL_TOKEN", "")
         self.clients = set()
         self.capture_enabled = True
+        self.no_caching_enabled = False
         self.mappings = []
         self.flows = {}
         self.events = asyncio.Queue(maxsize=1000)
@@ -38,6 +39,7 @@ class LensAddon:
             await self.server.wait_closed()
 
     def request(self, flow: http.HTTPFlow):
+        self.remove_conditional_cache_headers(flow)
         self.apply_mapping(flow)
         self.flows[flow.id] = flow
         self.emit_flow(flow)
@@ -82,7 +84,10 @@ class LensAddon:
                         break
                     authenticated = True
                     self.clients.add(writer)
-                    await self.write(writer, "authenticated", {"captureEnabled": self.capture_enabled})
+                    await self.write(writer, "authenticated", {
+                        "captureEnabled": self.capture_enabled,
+                        "noCachingEnabled": self.no_caching_enabled,
+                    })
                     continue
                 await self.handle_command(writer, message_type, payload, message.get("requestID"))
         finally:
@@ -101,6 +106,14 @@ class LensAddon:
             elif message_type == "setCaptureEnabled":
                 self.capture_enabled = bool(payload.get("enabled", True))
                 await self.write(writer, "captureState", {"enabled": self.capture_enabled}, request_id)
+            elif message_type == "setNoCaching":
+                self.no_caching_enabled = bool(payload.get("enabled", False))
+                await self.write(
+                    writer,
+                    "noCachingState",
+                    {"enabled": self.no_caching_enabled},
+                    request_id,
+                )
             elif message_type == "clearFlows":
                 self.flows.clear()
                 await self.write(writer, "sessionReset", {}, request_id)
@@ -119,6 +132,13 @@ class LensAddon:
                 await self.write_error(writer, "unknown_command", f"Unknown command: {message_type}", request_id)
         except Exception as error:
             await self.write_error(writer, "command_failed", str(error), request_id)
+
+    def remove_conditional_cache_headers(self, flow: http.HTTPFlow):
+        if not self.no_caching_enabled:
+            return
+        for name in ("if-none-match", "if-modified-since", "if-range"):
+            if name in flow.request.headers:
+                del flow.request.headers[name]
 
     def apply_mapping(self, flow: http.HTTPFlow):
         request = flow.request

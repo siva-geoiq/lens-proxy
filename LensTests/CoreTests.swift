@@ -104,6 +104,22 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(String(data: lines[1], encoding: .utf8), "{\"b\":2}")
     }
 
+    func testRememberedEmulatorSurvivesCleanupUntilManuallyForgotten() throws {
+        let suiteName = "LensTests.DeviceAttachment.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let preferences = DeviceAttachmentPreferences(defaults: defaults)
+
+        preferences.remember(emulatorSerial: "emulator-5554")
+        XCTAssertEqual(preferences.lastEmulatorSerial, "emulator-5554")
+
+        preferences.forget(emulatorSerial: "another-emulator")
+        XCTAssertEqual(preferences.lastEmulatorSerial, "emulator-5554")
+
+        preferences.forget(emulatorSerial: "emulator-5554")
+        XCTAssertNil(preferences.lastEmulatorSerial)
+    }
+
     private func makeRule(name: String = "Rule", path: String = "/v1/config", query: String? = nil) -> MappingRule {
         MappingRule(
             id: UUID(), name: name, enabled: true, order: 0, method: "POST", scheme: "https",

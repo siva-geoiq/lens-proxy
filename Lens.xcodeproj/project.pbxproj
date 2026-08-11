@@ -6,6 +6,23 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXContainerItemProxy section */
+		A10000033029D60000424932 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 47347D493029D60000424932 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 47347D503029D60000424932;
+			remoteInfo = Lens;
+		};
+		B10000033029D60000424932 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 47347D493029D60000424932 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 47347D503029D60000424932;
+			remoteInfo = Lens;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		47347D513029D60000424932 /* Lens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Lens.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000013029D60000424932 /* LensTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LensTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -29,23 +46,6 @@
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
-
-/* Begin PBXContainerItemProxy section */
-		A10000033029D60000424932 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 47347D493029D60000424932 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 47347D503029D60000424932;
-			remoteInfo = Lens;
-		};
-		B10000033029D60000424932 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 47347D493029D60000424932 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 47347D503029D60000424932;
-			remoteInfo = Lens;
-		};
-/* End PBXContainerItemProxy section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		47347D4E3029D60000424932 /* Frameworks */ = {
