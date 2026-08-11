@@ -624,6 +624,82 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: paths.mitmproxyConfigurationDirectory.path))
     }
 
+    func testHTTPParserWaitsForFragmentedBodyAndNormalizesHeaders() throws {
+        let prefix = Data("PUT /v1/capture/options HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 33\r\n\r\n".utf8)
+        let body = Data(#"{"removeConditionalHeaders":true}"#.utf8)
+        var partial = prefix
+        partial.append(body.prefix(8))
+        XCTAssertNil(try LensHTTPParser.parse(partial))
+
+        var complete = prefix
+        complete.append(body)
+        let request = try XCTUnwrap(LensHTTPParser.parse(complete))
+        XCTAssertEqual(request.method, "PUT")
+        XCTAssertEqual(request.path, "/v1/capture/options")
+        XCTAssertEqual(request.header("CONTENT-TYPE"), "application/json")
+        XCTAssertEqual(request.body, body)
+    }
+
+    func testHTTPParserRejectsChunkedAndOversizedRequests() {
+        let chunked = Data("POST /v1/status HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".utf8)
+        XCTAssertThrowsError(try LensHTTPParser.parse(chunked))
+
+        let oversized = Data(repeating: 0, count: LensHTTPParser.maximumRequestBytes + 1)
+        XCTAssertThrowsError(try LensHTTPParser.parse(oversized))
+    }
+
+    func testConfirmationIsOneUseAndBoundToRequestPayload() throws {
+        let store = LensConfirmationStore()
+        let request = LensHTTPRequest(
+            method: "POST",
+            target: "/v1/capture/clear",
+            path: "/v1/capture/clear",
+            query: [:],
+            headers: [:],
+            body: Data()
+        )
+        var confirmationID: String?
+        XCTAssertThrowsError(try store.authorize(request: request, summary: "Clear flows")) { error in
+            guard let problem = error as? LensAPIProblem,
+                  case let .object(details)? = problem.details,
+                  case let .string(identifier)? = details["confirmationId"] else {
+                return XCTFail("Expected a confirmation challenge")
+            }
+            confirmationID = identifier
+        }
+        var confirmed = request
+        confirmed.headers["x-lens-confirmation"] = try XCTUnwrap(confirmationID)
+        XCTAssertNoThrow(try store.authorize(request: confirmed, summary: "Clear flows"))
+        XCTAssertThrowsError(try store.authorize(request: confirmed, summary: "Clear flows"))
+    }
+
+    func testMappingRevisionChangesAndReorderRejectsIncompleteIDs() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MappingStore(fileURL: directory.appendingPathComponent("mappings.json"))
+        let first = store.addBlank()
+        let revision = store.revision
+        let second = store.addBlank(behavior: .rewriteRequest)
+        XCTAssertGreaterThan(store.revision, revision)
+        XCTAssertFalse(store.reorder(ids: [first]))
+        XCTAssertTrue(store.reorder(ids: [second, first]))
+        XCTAssertEqual(store.rules.map(\.id), [second, first])
+    }
+
+    func testOpenAPIIsValidJSONAndDocumentsEveryRoutedArea() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let data = try Data(contentsOf: projectRoot.appendingPathComponent("Lens/Resources/openapi.json"))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let paths = try XCTUnwrap(object["paths"] as? [String: Any])
+        for path in [
+            "/v1/status", "/v1/events", "/v1/engine/start", "/v1/capture/options",
+            "/v1/flows", "/v1/search", "/v1/mappings", "/v1/sessions/save",
+            "/v1/devices", "/v1/devices/{serial}/inspection"
+        ] {
+            XCTAssertNotNil(paths[path], "OpenAPI is missing \(path)")
+        }
+    }
+
     private func makeRule(name: String = "Rule", path: String = "/v1/config", query: String? = nil) -> MappingRule {
         MappingRule(
             id: UUID(), name: name, enabled: true, order: 0, method: "POST", scheme: "https",

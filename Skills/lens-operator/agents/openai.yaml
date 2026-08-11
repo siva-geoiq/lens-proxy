@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lens Operator"
+  short_description: "Operate Lens Android network debugging"
+  default_prompt: "Use $lens-operator to inspect and control Android network traffic through Lens."

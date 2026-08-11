@@ -54,7 +54,7 @@ struct ContentView: View {
             )
         ) {
             if case .failed = model.engineState {
-                Button("Retry") { model.startEngine() }
+                Button("Retry") { model.automation.startEngine() }
             }
             Button("Dismiss", role: .cancel) { model.lastError = nil }
         } message: {
@@ -79,12 +79,14 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .navigation) {
-            Button(action: model.toggleCapture) {
+            Button {
+                model.automation.setCapturePaused(!model.captures.isCapturePaused)
+            } label: {
                 Label(model.captures.isCapturePaused ? "Resume" : "Pause", systemImage: model.captures.isCapturePaused ? "play.fill" : "pause.fill")
             }
             .help(model.captures.isCapturePaused ? "Resume capture" : "Pause capture")
             .keyboardShortcut("b", modifiers: .command)
-            Button(action: model.clearFlows) {
+            Button(action: model.automation.clearCapture) {
                 Label("Clear", systemImage: "trash")
             }
             .help("Clear captured requests")
@@ -99,7 +101,9 @@ struct ContentView: View {
             }
             .help("Search all captured requests and responses (Command-F)")
             .accessibilityLabel("Search all captured requests and responses")
-            Button(action: model.toggleNoCaching) {
+            Button {
+                model.automation.setRemoveConditionalHeaders(!model.isNoCachingEnabled)
+            } label: {
                 Label(
                     "No Caching",
                     systemImage: model.isNoCachingEnabled ? "externaldrive.fill.badge.xmark" : "externaldrive.badge.xmark"

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -242,18 +243,17 @@ struct JSONSyntaxViewer: View {
     var body: some View {
         if let document {
             GeometryReader { viewport in
+                let renderedLines = lines(for: document)
+                let contentWidth = max(viewport.size.width, minimumContentWidth(for: renderedLines))
                 ScrollView([.horizontal, .vertical]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(lines(for: document).enumerated()), id: \.element.id) { index, line in
+                        ForEach(Array(renderedLines.enumerated()), id: \.element.id) { index, line in
                             syntaxLine(line, number: index + 1)
                         }
                     }
                     .padding(.vertical, 8)
-                    .frame(
-                        minWidth: viewport.size.width,
-                        minHeight: viewport.size.height,
-                        alignment: .topLeading
-                    )
+                    .frame(width: contentWidth, alignment: .topLeading)
+                    .frame(minHeight: viewport.size.height, alignment: .topLeading)
                 }
                 .frame(width: viewport.size.width, height: viewport.size.height, alignment: .topLeading)
             }
@@ -268,6 +268,16 @@ struct JSONSyntaxViewer: View {
 
     private func lines(for document: JSONValue) -> [JSONSyntaxLine] {
         JSONSyntaxLineBuilder.lines(for: document, collapsedPaths: collapsedPaths)
+    }
+
+    private func minimumContentWidth(for lines: [JSONSyntaxLine]) -> CGFloat {
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let widestLine = lines.map { line in
+            let textWidth = (line.plainText as NSString).size(withAttributes: [.font: font]).width
+            return textWidth + CGFloat(line.indentation) * 18
+        }.max() ?? 0
+        // Line number, gutter spacing, disclosure icon, horizontal padding and trailing breathing room.
+        return ceil(widestLine + 38 + 8 + 18 + 12 + 12)
     }
 
     private func syntaxLine(_ line: JSONSyntaxLine, number: Int) -> some View {

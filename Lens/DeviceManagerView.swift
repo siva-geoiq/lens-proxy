@@ -69,7 +69,7 @@ struct DeviceManagerView: View {
                                 }
                                 if device.customName != nil {
                                     Button("Reset Device Name", systemImage: "arrow.uturn.backward") {
-                                        model.devices.resetName(for: device)
+                                        try? model.automation.renameDevice(serial: device.serial, name: nil)
                                     }
                                 }
                                 Divider()
@@ -83,7 +83,7 @@ struct DeviceManagerView: View {
                             .accessibilityLabel("Device actions for \(device.displayName)")
                             .help("Rename or reset this device name")
                             if device.isAttached {
-                                Button("Detach") { model.detach(device) }
+                                Button("Detach") { model.automation.requestDetach(device) }
                             } else if model.attachingDeviceID == device.serial {
                                 HStack(spacing: 6) {
                                     ProgressView().controlSize(.small)
@@ -93,7 +93,7 @@ struct DeviceManagerView: View {
                             } else {
                                 Button("Attach") {
                                     if model.devices.activeVPNPackage != nil { pendingVPNDevice = device }
-                                    else { model.attach(device) }
+                                    else { model.automation.requestAttach(device) }
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .disabled(model.attachingDeviceID != nil)
@@ -106,7 +106,7 @@ struct DeviceManagerView: View {
                             }
                             if device.customName != nil {
                                 Button("Reset Device Name", systemImage: "arrow.uturn.backward") {
-                                    model.devices.resetName(for: device)
+                                    try? model.automation.renameDevice(serial: device.serial, name: nil)
                                 }
                             }
                         }
@@ -139,7 +139,7 @@ struct DeviceManagerView: View {
             titleVisibility: .visible
         ) {
             Button("Stop VPN and Attach", role: .destructive) {
-                if let device = pendingVPNDevice { model.attach(device, stopConflictingVPN: true) }
+                if let device = pendingVPNDevice { model.automation.requestAttach(device, stopConflictingVPN: true) }
                 pendingVPNDevice = nil
             }
             Button("Cancel", role: .cancel) { pendingVPNDevice = nil }
@@ -191,7 +191,7 @@ struct DeviceRenameView: View {
             HStack {
                 if device.customName != nil {
                     Button("Reset to \(device.model)") {
-                        model.devices.resetName(for: device)
+                        try? model.automation.renameDevice(serial: device.serial, name: nil)
                         dismiss()
                     }
                 }
@@ -199,7 +199,7 @@ struct DeviceRenameView: View {
                 Button("Cancel", role: .cancel) { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("Save") {
-                    model.devices.rename(device, to: name)
+                    try? model.automation.renameDevice(serial: device.serial, name: name)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)

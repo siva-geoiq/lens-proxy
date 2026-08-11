@@ -12,6 +12,8 @@ final class LensModel {
     let mappings: MappingStore
     let devices: DeviceManager
     let inspector: AndroidInspectorManager
+    @ObservationIgnored lazy var automation = LensAutomationController(model: self)
+    @ObservationIgnored lazy var apiServer = LensAPIServer(controller: automation)
 
     private let engine: EngineProcessManager
     private let bridge: BridgeClient
@@ -59,15 +61,27 @@ final class LensModel {
                 Task { @MainActor in self?.lastError = error.localizedDescription }
             }
         }
-        mappings.onRulesChanged = { [weak self] rules in self?.sendMappings(rules) }
+        mappings.onRulesChanged = { [weak self] rules in
+            guard let self else { return }
+            self.sendMappings(rules)
+            self.automation.publish(
+                type: "mappings.snapshot",
+                payload: (try? JSONValue(rules)) ?? .array([])
+            )
+        }
         devices.onDevicesChanged = { [weak self] devices in
             guard let self else { return }
             self.captures.attributeFlows(to: devices)
             self.inspector.updateDevices(devices)
+            self.automation.publishDevices()
             Task { await self.autoAttachRememberedDevices() }
         }
         inspector.onError = { [weak self] message in self?.lastError = message }
         inspector.onTrace = { [weak self] in self?.applyPendingAndroidContexts() }
+    }
+
+    func startAutomationAPI() {
+        apiServer.start()
     }
 
     func startEngine() {
@@ -269,6 +283,11 @@ final class LensModel {
         panel.allowedContentTypes = [.data]
         panel.nameFieldStringValue = "Lens Session.mitm"
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try automation.saveSession(path: url.path) }
+        catch { lastError = error.localizedDescription }
+    }
+
+    func saveSession(at url: URL) {
         bridge.send(type: "saveSession", payload: ["path": url.path])
     }
 
@@ -276,6 +295,11 @@ final class LensModel {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try automation.openSession(path: url.path) }
+        catch { lastError = error.localizedDescription }
+    }
+
+    func openSession(at url: URL) {
         bridge.send(type: "openSession", payload: ["path": url.path])
     }
 
@@ -301,12 +325,29 @@ final class LensModel {
     }
 
     func shutdown() async {
+        apiServer.stop()
         allowsAutomaticDeviceSync = false
         devicePreparationTask?.cancel()
         devices.stopMonitoring()
         await inspector.stop()
         await devices.restoreAttachedDevicesAndWait()
         stopEngine()
+    }
+
+    func attachForAutomation(serial: String, stopConflictingVPN: Bool = false) async throws {
+        guard attachingDeviceID == nil else {
+            throw LensAutomationError.conflict("Another device attachment is already in progress.")
+        }
+        guard case .running = engineState else {
+            throw LensAutomationError.unavailable("The Lens proxy engine is not running.")
+        }
+        guard let device = devices.devices.first(where: { $0.serial == serial }) else {
+            throw LensAutomationError.notFound("Device \(serial) was not found.")
+        }
+        attachingDeviceID = serial
+        defer { attachingDeviceID = nil }
+        try await devices.attach(device, proxyPort: proxyPort, stopConflictingVPN: stopConflictingVPN)
+        captures.attributeFlows(to: devices.devices)
     }
 
 #if DEBUG
@@ -370,6 +411,7 @@ final class LensModel {
                     "Captured \(flow.method, privacy: .public) \(flow.host, privacy: .public)\(pathWithoutQuery, privacy: .public) status \(flow.responseStatus ?? -1) mapping \(mappingName, privacy: .public) rewrite \(rewriteName, privacy: .public)"
                 )
                 captures.upsert(flow)
+                automation.publishFlow(flow)
             case "sessionReset":
                 captures.clear()
             case "captureState":

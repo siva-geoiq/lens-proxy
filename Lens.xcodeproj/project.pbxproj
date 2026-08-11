@@ -105,6 +105,7 @@
 				C10000013029D60000424932 /* Embed mitmproxy Runtime */,
 				C10000023029D60000424932 /* Embed Android Platform Tools */,
 				C10000033029D60000424932 /* Embed Android Inspector Agent */,
+				C10000043029D60000424932 /* Embed Lens Operator Skill */,
 			);
 			buildRules = (
 			);
@@ -302,6 +303,37 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
 			shellScript = "\"$SRCROOT/Scripts/embed_android_inspector_agent.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		C10000043029D60000424932 /* Embed Lens Operator Skill */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Scripts/embed_agent_skill.sh",
+				"$(SRCROOT)/Skills/lens-operator/SKILL.md",
+				"$(SRCROOT)/Skills/lens-operator/agents/openai.yaml",
+				"$(SRCROOT)/Skills/lens-operator/scripts/lensctl",
+				"$(SRCROOT)/Skills/lens-operator/references/api.md",
+				"$(SRCROOT)/Skills/lens-operator/references/workflows.md",
+			);
+			name = "Embed Lens Operator Skill";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/AgentSkills/lens-operator/SKILL.md",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/AgentSkills/lens-operator/agents/openai.yaml",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/AgentSkills/lens-operator/scripts/lensctl",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/AgentSkills/lens-operator/references/api.md",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/AgentSkills/lens-operator/references/workflows.md",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "\"$SRCROOT/Scripts/embed_agent_skill.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */

@@ -130,7 +130,7 @@ struct SidebarView: View {
 
             if device.customName != nil {
                 Button {
-                    model.devices.resetName(for: device)
+                    try? model.automation.renameDevice(serial: device.serial, name: nil)
                 } label: {
                     Label("Reset Device Name", systemImage: "arrow.uturn.backward")
                 }
@@ -165,13 +165,13 @@ struct SidebarView: View {
 
             if device.isAttached {
                 Button(role: .destructive) {
-                    model.detach(device)
+                    model.automation.requestDetach(device)
                 } label: {
                     Label("Detach from Lens", systemImage: "iphone.slash")
                 }
             } else {
                 Button {
-                    model.attach(device)
+                    model.automation.requestAttach(device)
                 } label: {
                     Label("Attach to Lens", systemImage: "iphone.and.arrow.forward")
                 }

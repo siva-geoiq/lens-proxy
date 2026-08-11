@@ -5,6 +5,7 @@ import Observation
 @Observable
 final class MappingStore {
     private(set) var rules: [MappingRule] = []
+    private(set) var revision = 0
     var selectedRuleID: UUID?
     var searchText = ""
     var onRulesChanged: (([MappingRule]) -> Void)?
@@ -123,7 +124,8 @@ final class MappingStore {
         return rule.id
     }
 
-    func addBlank(behavior: MappingBehavior = .localResponse) {
+    @discardableResult
+    func addBlank(behavior: MappingBehavior = .localResponse) -> UUID {
         let rule = MappingRule(
             id: UUID(),
             name: behavior == .localResponse ? "New local response" : "New request rewrite",
@@ -149,6 +151,20 @@ final class MappingStore {
         rules.append(rule)
         selectedRuleID = rule.id
         persistAndNotify()
+        return rule.id
+    }
+
+    @discardableResult
+    func add(_ rule: MappingRule) -> UUID {
+        var addedRule = rule
+        if rules.contains(where: { $0.id == addedRule.id }) {
+            addedRule.id = UUID()
+        }
+        addedRule.order = rules.count
+        rules.append(addedRule)
+        selectedRuleID = addedRule.id
+        persistAndNotify()
+        return addedRule.id
     }
 
     func update(_ rule: MappingRule) {
@@ -163,8 +179,9 @@ final class MappingStore {
         persistAndNotify()
     }
 
-    func duplicate(_ id: UUID) {
-        guard let index = rules.firstIndex(where: { $0.id == id }) else { return }
+    @discardableResult
+    func duplicate(_ id: UUID) -> UUID? {
+        guard let index = rules.firstIndex(where: { $0.id == id }) else { return nil }
         var copy = rules[index]
         copy.id = UUID()
         copy.name += " Copy"
@@ -173,6 +190,7 @@ final class MappingStore {
         normalizeOrder()
         selectedRuleID = copy.id
         persistAndNotify()
+        return copy.id
     }
 
     func remove(_ id: UUID) {
@@ -194,6 +212,16 @@ final class MappingStore {
         persistAndNotify()
     }
 
+    @discardableResult
+    func reorder(ids: [UUID]) -> Bool {
+        guard ids.count == rules.count, Set(ids) == Set(rules.map(\.id)) else { return false }
+        let byID = Dictionary(uniqueKeysWithValues: rules.map { ($0.id, $0) })
+        rules = ids.compactMap { byID[$0] }
+        normalizeOrder()
+        persistAndNotify()
+        return true
+    }
+
     private func normalizeOrder() {
         for index in rules.indices { rules[index].order = index }
     }
@@ -202,9 +230,11 @@ final class MappingStore {
         guard let data = try? Data(contentsOf: fileURL),
               let decoded = try? JSONDecoder().decode([MappingRule].self, from: data) else { return }
         rules = decoded.sorted { $0.order < $1.order }
+        revision = rules.isEmpty ? 0 : 1
     }
 
     private func persistAndNotify() {
+        revision &+= 1
         if let data = try? JSONEncoder().encode(rules) {
             try? data.write(to: fileURL, options: .atomic)
         }

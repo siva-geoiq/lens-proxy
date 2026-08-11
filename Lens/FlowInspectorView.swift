@@ -28,6 +28,7 @@ struct FlowInspectorView: View {
                         .fixedSize()
                     Text(flow.displayURL)
                         .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)

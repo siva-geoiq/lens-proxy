@@ -1,0 +1,60 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Lens Agent API",
+    "version": "1.0.0",
+    "description": "Authenticated loopback automation API for Lens Android network debugging."
+  },
+  "servers": [{"url": "http://127.0.0.1:{port}", "variables": {"port": {"default": "0"}}}],
+  "security": [{"bearerAuth": []}],
+  "components": {
+    "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}},
+    "parameters": {
+      "flowId": {"name": "flowId", "in": "path", "required": true, "schema": {"type": "string"}},
+      "ifMatch": {"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}}
+    },
+    "schemas": {
+      "Envelope": {"type": "object", "required": ["apiVersion", "requestId", "data"], "properties": {"apiVersion": {"const": "1"}, "requestId": {"type": "string"}, "data": {}}},
+      "ErrorEnvelope": {"type": "object", "required": ["apiVersion", "requestId", "error"], "properties": {"apiVersion": {"const": "1"}, "requestId": {"type": "string"}, "error": {"type": "object", "required": ["code", "message"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "details": {}}}}},
+      "Operation": {"type": "object", "required": ["id", "state", "createdAt"], "properties": {"id": {"type": "string", "format": "uuid"}, "state": {"enum": ["pending", "running", "succeeded", "failed"]}, "createdAt": {"type": "number"}, "completedAt": {"type": ["number", "null"]}, "result": {}, "error": {}}},
+      "PathInput": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
+      "InspectionInput": {"type": "object", "required": ["mode"], "properties": {"mode": {"enum": ["automatic", "package", "off"]}, "package": {"type": "string"}}}
+    }
+  },
+  "paths": {
+    "/v1/status": {"get": {"operationId": "getStatus", "responses": {"200": {"description": "Lens status"}}}},
+    "/v1/capabilities": {"get": {"operationId": "getCapabilities", "responses": {"200": {"description": "Capabilities"}}}},
+    "/v1/openapi.json": {"get": {"operationId": "getOpenAPI", "responses": {"200": {"description": "This document"}}}},
+    "/v1/events": {"get": {"operationId": "streamEvents", "responses": {"200": {"description": "Server-sent event stream", "content": {"text/event-stream": {}}}}}},
+    "/v1/engine/log": {"get": {"operationId": "getEngineLog", "responses": {"200": {"description": "Recent engine log"}}}},
+    "/v1/engine/start": {"post": {"operationId": "startEngine", "responses": {"202": {"description": "Operation accepted"}}}},
+    "/v1/engine/stop": {"post": {"operationId": "stopEngine", "responses": {"202": {"description": "Operation accepted"}, "409": {"description": "Confirmation required"}}}},
+    "/v1/engine/restart": {"post": {"operationId": "restartEngine", "responses": {"202": {"description": "Operation accepted"}, "409": {"description": "Confirmation required"}}}},
+    "/v1/settings": {"patch": {"operationId": "updateSettings", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"proxyPort": {"type": "integer", "minimum": 1, "maximum": 65535}}}}}}, "responses": {"200": {"description": "Updated"}}}},
+    "/v1/capture/pause": {"post": {"operationId": "pauseCapture", "responses": {"200": {"description": "Paused"}}}},
+    "/v1/capture/resume": {"post": {"operationId": "resumeCapture", "responses": {"200": {"description": "Resumed"}}}},
+    "/v1/capture/clear": {"post": {"operationId": "clearCapture", "responses": {"200": {"description": "Cleared"}, "409": {"description": "Confirmation required"}}}},
+    "/v1/capture/options": {"put": {"operationId": "setCaptureOptions", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["removeConditionalHeaders"], "properties": {"removeConditionalHeaders": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "Updated"}}}},
+    "/v1/flows": {"get": {"operationId": "listFlows", "parameters": [{"name": "deviceId", "in": "query", "schema": {"type": "string"}}, {"name": "host", "in": "query", "schema": {"type": "string"}}, {"name": "method", "in": "query", "schema": {"type": "string"}}, {"name": "kind", "in": "query", "schema": {"enum": ["json", "media", "websocket"]}}, {"name": "search", "in": "query", "schema": {"type": "string"}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "maximum": 500}}], "responses": {"200": {"description": "Paginated flow metadata"}}}},
+    "/v1/search": {"get": {"operationId": "searchFlows", "parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Matching flows"}}}},
+    "/v1/flows/{flowId}": {"get": {"operationId": "getFlow", "parameters": [{"$ref": "#/components/parameters/flowId"}], "responses": {"200": {"description": "Flow detail"}}}},
+    "/v1/flows/{flowId}/curl": {"get": {"operationId": "getFlowCurl", "parameters": [{"$ref": "#/components/parameters/flowId"}], "responses": {"200": {"description": "cURL"}}}},
+    "/v1/flows/{flowId}/{side}/body": {"get": {"operationId": "getFlowBody", "parameters": [{"$ref": "#/components/parameters/flowId"}, {"name": "side", "in": "path", "required": true, "schema": {"enum": ["request", "response"]}}], "responses": {"200": {"description": "Original body bytes"}}}},
+    "/v1/flows/{flowId}/mappings": {"post": {"operationId": "createMappingFromFlow", "parameters": [{"$ref": "#/components/parameters/flowId"}], "responses": {"201": {"description": "Mapping created"}}}},
+    "/v1/mappings": {"get": {"operationId": "listMappings", "responses": {"200": {"description": "Rules and revision"}}}, "post": {"operationId": "createMapping", "responses": {"201": {"description": "Created"}}}},
+    "/v1/mappings/order": {"put": {"operationId": "reorderMappings", "parameters": [{"$ref": "#/components/parameters/ifMatch"}], "responses": {"200": {"description": "Reordered"}, "412": {"description": "Revision mismatch"}}}},
+    "/v1/mappings/{mappingId}": {"get": {"operationId": "getMapping", "responses": {"200": {"description": "Mapping"}}}, "put": {"operationId": "updateMapping", "responses": {"200": {"description": "Updated"}}}, "delete": {"operationId": "deleteMapping", "responses": {"200": {"description": "Deleted"}, "409": {"description": "Confirmation required"}}}},
+    "/v1/mappings/{mappingId}/enabled": {"put": {"operationId": "setMappingEnabled", "responses": {"200": {"description": "Updated"}}}},
+    "/v1/mappings/{mappingId}/duplicate": {"post": {"operationId": "duplicateMapping", "responses": {"201": {"description": "Created"}}}},
+    "/v1/sessions/save": {"post": {"operationId": "saveSession", "responses": {"202": {"description": "Accepted"}, "409": {"description": "Overwrite confirmation required"}}}},
+    "/v1/sessions/open": {"post": {"operationId": "openSession", "responses": {"202": {"description": "Accepted"}, "409": {"description": "Replacement confirmation required"}}}},
+    "/v1/devices": {"get": {"operationId": "listDevices", "responses": {"200": {"description": "Devices"}}}},
+    "/v1/devices/refresh": {"post": {"operationId": "refreshDevices", "responses": {"202": {"description": "Accepted"}}}},
+    "/v1/devices/{serial}": {"get": {"operationId": "getDevice", "responses": {"200": {"description": "Device"}}}, "patch": {"operationId": "renameDevice", "responses": {"200": {"description": "Updated"}}}},
+    "/v1/devices/{serial}/attach": {"post": {"operationId": "attachDevice", "responses": {"202": {"description": "Accepted"}, "409": {"description": "VPN confirmation required"}}}},
+    "/v1/devices/{serial}/detach": {"post": {"operationId": "detachDevice", "responses": {"202": {"description": "Accepted"}}}},
+    "/v1/devices/{serial}/inspection": {"get": {"operationId": "getInspection", "responses": {"200": {"description": "Inspection state"}}}, "put": {"operationId": "setInspection", "responses": {"200": {"description": "Updated"}}}},
+    "/v1/devices/{serial}/inspection/processes": {"get": {"operationId": "listDebuggableProcesses", "responses": {"200": {"description": "Processes"}}}},
+    "/v1/operations/{operationId}": {"get": {"operationId": "getOperation", "responses": {"200": {"description": "Operation"}}}}
+  }
+}

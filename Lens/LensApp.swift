@@ -34,6 +34,7 @@ struct LensApp: App {
                 .task {
                     applicationDelegate.model = model
                     guard !isRunningUnitTests else { return }
+                    model.startAutomationAPI()
                     if ProcessInfo.processInfo.arguments.contains("--ui-testing") {
                         model.prepareUITestFixture()
                     } else {
@@ -58,15 +59,17 @@ struct LensApp: App {
                     .keyboardShortcut("f", modifiers: .command)
             }
             CommandMenu("Proxy") {
-                Button(model.captures.isCapturePaused ? "Resume Capture" : "Pause Capture") { model.toggleCapture() }
+                Button(model.captures.isCapturePaused ? "Resume Capture" : "Pause Capture") {
+                    model.automation.setCapturePaused(!model.captures.isCapturePaused)
+                }
                     .keyboardShortcut("b", modifiers: .command)
-                Button("Clear Flows") { model.clearFlows() }
+                Button("Clear Flows") { model.automation.clearCapture() }
                     .keyboardShortcut(.delete, modifiers: [.command, .shift])
                 Toggle(
                     "No Caching",
                     isOn: Binding(
                         get: { model.isNoCachingEnabled },
-                        set: { model.setNoCaching($0) }
+                        set: { model.automation.setRemoveConditionalHeaders($0) }
                     )
                 )
                 Divider()

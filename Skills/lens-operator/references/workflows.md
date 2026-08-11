@@ -1,0 +1,42 @@
+# Lens Workflows
+
+## Attach and capture
+
+1. Run `lensctl status` and start the engine if it is stopped.
+2. `POST /v1/devices/refresh`, poll the returned operation, then `GET /v1/devices`.
+3. Attach the exact serial with `POST /v1/devices/{serial}/attach` and an `Idempotency-Key`.
+4. Poll its operation until `succeeded`, trigger the app request, then filter `/v1/flows` by `deviceId` and host.
+5. Detach the device at the end only if this workflow attached it.
+
+If attachment reports a VPN conflict, do not immediately retry with `stopConflictingVPN`. Ask the user, send `{"stopConflictingVPN":true}`, show the confirmation summary, and only then repeat with its confirmation ID.
+
+## Mock a response
+
+1. Identify one exact flow.
+2. `POST /v1/flows/{id}/mappings` with `{"behavior":"localResponse"}`.
+3. `GET /v1/mappings`, locate the returned ID, preserve its match fields and response headers, edit the response body/status, then `PUT` it with the current `ETag` in `If-Match`.
+4. Trigger the request again and verify `mappedRuleID` on the new flow.
+
+## Rewrite a request
+
+Create a mapping with `{"behavior":"rewriteRequest"}`. Set `rewriteHeaders` and/or `rewriteBody`; leave either false to pass that portion through unchanged. Trigger a fresh device request because rewrites apply before upstream transmission, not retroactively.
+
+## Firebase Remote Config
+
+Enable `removeConditionalHeaders` through `/v1/capture/options` before triggering the fetch. Search for `firebaseremoteconfig.googleapis.com` and `firebase:fetch`. A `NO_CHANGE` response usually indicates server/cache behavior; use a local response mapping to return a complete Firebase fetch response when testing configuration changes.
+
+## Sessions
+
+Use absolute `.mitm` paths. Opening replaces the current capture and therefore requires confirmation. Saving over an existing file also requires confirmation. Persisted mapping rules remain independent of sessions.
+
+## Deep Inspection
+
+Check `data.androidDeepInspection.available` in `/v1/capabilities`. Read `/v1/devices/{serial}/inspection/processes`, then set the mode with one of:
+
+```json
+{"mode":"automatic"}
+{"mode":"package","package":"com.example.app"}
+{"mode":"off"}
+```
+
+Treat foreground Activity as observational. Use a call site only when the flow carries a high-confidence Android context; do not infer ownership from timestamps alone.

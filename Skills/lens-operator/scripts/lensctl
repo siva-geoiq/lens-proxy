@@ -1,0 +1,112 @@
+#!/bin/bash
+
+set -euo pipefail
+
+DISCOVERY_FILE="${HOME}/Library/Application Support/Lens/api.json"
+KEYCHAIN_SERVICE="com.lenskart.lens.api"
+KEYCHAIN_ACCOUNT="local-automation"
+BUNDLE_ID="com.lenskart.lens.Lens"
+
+usage() {
+  /bin/echo "Usage: lensctl status|capabilities|events|openapi|discover"
+  /bin/echo "       lensctl request METHOD PATH [JSON|@FILE] [--confirm ID] [--if-match ETAG] [--idempotency KEY]"
+}
+
+wait_for_lens() {
+  if ! api_ready; then
+    /usr/bin/open -b "${BUNDLE_ID}"
+  fi
+  local attempt=0
+  while [[ ${attempt} -lt 150 ]]; do
+    if api_ready; then
+      return
+    fi
+    /bin/sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  /bin/echo "Lens API did not become ready within 15 seconds." >&2
+  exit 1
+}
+
+api_ready() {
+  [[ -f "${DISCOVERY_FILE}" ]] || return 1
+  local url
+  url="$(/usr/bin/plutil -extract baseURL raw -o - "${DISCOVERY_FILE}" 2>/dev/null)" || return 1
+  local token
+  token="$(api_token 2>/dev/null)" || return 1
+  /usr/bin/curl --silent --fail --max-time 0.5 --header "Authorization: Bearer ${token}" "${url}/v1/status" >/dev/null 2>&1
+}
+
+base_url() {
+  /usr/bin/plutil -extract baseURL raw -o - "${DISCOVERY_FILE}"
+}
+
+api_token() {
+  /usr/bin/security find-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}" -w
+}
+
+request() {
+  local method="$1"
+  local path="$2"
+  shift 2
+  local body=""
+  local confirmation=""
+  local if_match=""
+  local idempotency=""
+  if [[ $# -gt 0 && "$1" != --* ]]; then
+    body="$1"
+    shift
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --confirm) confirmation="$2"; shift 2 ;;
+      --if-match) if_match="$2"; shift 2 ;;
+      --idempotency) idempotency="$2"; shift 2 ;;
+      *) /bin/echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    esac
+  done
+
+  wait_for_lens
+  local url
+  url="$(base_url)${path}"
+  local token
+  token="$(api_token)"
+  local args=(--silent --show-error --fail-with-body --request "${method}" --header "Authorization: Bearer ${token}" --header "Accept: application/json")
+  if [[ -n "${body}" ]]; then
+    args+=(--header "Content-Type: application/json" --data-binary "${body}")
+  fi
+  if [[ -n "${confirmation}" ]]; then args+=(--header "X-Lens-Confirmation: ${confirmation}"); fi
+  if [[ -n "${if_match}" ]]; then args+=(--header "If-Match: ${if_match}"); fi
+  if [[ -n "${idempotency}" ]]; then args+=(--header "Idempotency-Key: ${idempotency}"); fi
+  /usr/bin/curl "${args[@]}" "${url}"
+}
+
+command_name="${1:-}"
+case "${command_name}" in
+  status)
+    request GET /v1/status
+    ;;
+  capabilities)
+    request GET /v1/capabilities
+    ;;
+  events)
+    wait_for_lens
+    /usr/bin/curl --silent --show-error --no-buffer --header "Authorization: Bearer $(api_token)" "$(base_url)/v1/events"
+    ;;
+  openapi)
+    request GET /v1/openapi.json
+    ;;
+  discover)
+    wait_for_lens
+    /bin/cat "${DISCOVERY_FILE}"
+    ;;
+  request)
+    [[ $# -ge 3 ]] || { usage; exit 2; }
+    shift
+    request "$@"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

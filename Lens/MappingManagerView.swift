@@ -21,7 +21,7 @@ struct MappingManagerView: View {
                         HStack(spacing: 8) {
                             Toggle("", isOn: Binding(
                                 get: { rule.enabled },
-                                set: { _ in mappings.toggle(rule.id) }
+                                set: { enabled in try? model.automation.setMappingEnabled(id: rule.id, enabled: enabled) }
                             ))
                             .toggleStyle(.switch)
                             .labelsHidden()
@@ -39,11 +39,11 @@ struct MappingManagerView: View {
                         }
                         .tag(rule.id)
                         .contextMenu {
-                            Button("Duplicate") { mappings.duplicate(rule.id) }
-                            Button("Delete", role: .destructive) { mappings.remove(rule.id) }
+                            Button("Duplicate") { _ = try? model.automation.duplicateMapping(id: rule.id) }
+                            Button("Delete", role: .destructive) { try? model.automation.deleteMapping(id: rule.id) }
                         }
                     }
-                    .onMove(perform: mappings.move)
+                    .onMove(perform: model.automation.moveMappings)
                 }
             }
             .navigationSplitViewColumnWidth(min: 280, ideal: 340)
@@ -51,16 +51,16 @@ struct MappingManagerView: View {
                 ToolbarItemGroup {
                     Menu {
                         Button("Local Response", systemImage: MappingBehavior.localResponse.systemImage) {
-                            mappings.addBlank(behavior: .localResponse)
+                            _ = model.automation.addBlankMapping(behavior: .localResponse)
                         }
                         Button("Request Rewrite", systemImage: MappingBehavior.rewriteRequest.systemImage) {
-                            mappings.addBlank(behavior: .rewriteRequest)
+                            _ = model.automation.addBlankMapping(behavior: .rewriteRequest)
                         }
                     } label: { Image(systemName: "plus") }
                         .accessibilityLabel("Add mapping")
                         .help("Add a local response or request rewrite")
                     Button {
-                        if let id = mappings.selectedRuleID { mappings.remove(id) }
+                        if let id = mappings.selectedRuleID { try? model.automation.deleteMapping(id: id) }
                     } label: { Image(systemName: "trash") }
                     .accessibilityLabel("Delete mapping")
                     .help("Delete selected mapping")
@@ -70,7 +70,7 @@ struct MappingManagerView: View {
         } detail: {
             if let id = mappings.selectedRuleID,
                let rule = mappings.rules.first(where: { $0.id == id }) {
-                MappingEditorView(rule: rule) { mappings.update($0) }
+                MappingEditorView(rule: rule) { try? model.automation.updateMapping($0) }
                     .id(rule.id)
             } else {
                 ContentUnavailableView("Select a mapping", systemImage: "arrow.triangle.branch", description: Text("Create a mapping or choose one from the sidebar."))

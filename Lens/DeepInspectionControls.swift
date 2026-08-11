@@ -22,7 +22,7 @@ struct DeepInspectionMenu: View {
 
     private func selectionButton(_ selection: DeepInspectionSelection, title: String, systemImage: String) -> some View {
         Button {
-            model.inspector.setSelection(selection, for: device)
+            model.automation.setInspection(selection, for: device)
         } label: {
             Label(title, systemImage: model.inspector.selection(for: device) == selection ? "checkmark" : systemImage)
         }

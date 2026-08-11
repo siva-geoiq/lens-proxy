@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(LensModel.self) private var model
     @State private var proxyPort = 8080
+    private let exporter = AgentSkillExporter()
 
     var body: some View {
         Form {
@@ -17,6 +18,37 @@ struct SettingsView: View {
                 LabeledContent("Runtime") {
                     Label("Bundled ADB 37.0.1", systemImage: "shippingbox.fill")
                         .foregroundStyle(.secondary)
+                }
+            }
+            Section("Agent API") {
+                LabeledContent("Status") {
+                    Label(apiStatus, systemImage: apiStatusIcon)
+                        .foregroundStyle(apiStatusColor)
+                }
+                LabeledContent("Access") {
+                    Text("Authenticated localhost only")
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Clients") {
+                    Text("\(model.apiServer.connectedClients)")
+                        .monospacedDigit()
+                }
+                HStack {
+                    Button("Rotate API Token") {
+                        do { try model.apiServer.rotateToken() }
+                        catch { model.lastError = error.localizedDescription }
+                    }
+                    .help("Invalidate current agent connections and create a new Keychain token")
+                    Button("Export OpenAPI…") {
+                        do { try exporter.exportOpenAPI() }
+                        catch { model.lastError = error.localizedDescription }
+                    }
+                    .help("Export the Lens API schema")
+                    Button("Export Agent Skill…") {
+                        do { try exporter.exportSkill() }
+                        catch { model.lastError = error.localizedDescription }
+                    }
+                    .help("Export the portable lens-operator skill for a coding agent")
                 }
             }
             HStack {
@@ -34,6 +66,34 @@ struct SettingsView: View {
     }
 
     private func apply() {
-        model.applyEngineSettings(proxyPort: proxyPort)
+        do { try model.automation.setProxyPort(proxyPort) }
+        catch { model.lastError = error.localizedDescription }
+    }
+
+    private var apiStatus: String {
+        switch model.apiServer.state {
+        case .stopped: "Stopped"
+        case .starting: "Starting…"
+        case let .running(port): "Listening on 127.0.0.1:\(port)"
+        case let .failed(message): "Failed: \(message)"
+        }
+    }
+
+    private var apiStatusIcon: String {
+        switch model.apiServer.state {
+        case .running: "checkmark.circle.fill"
+        case .starting: "hourglass"
+        case .failed: "exclamationmark.triangle.fill"
+        case .stopped: "circle"
+        }
+    }
+
+    private var apiStatusColor: Color {
+        switch model.apiServer.state {
+        case .running: .green
+        case .starting: .orange
+        case .failed: .red
+        case .stopped: .secondary
+        }
     }
 }
