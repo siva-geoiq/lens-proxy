@@ -41,10 +41,92 @@ final class MappingStore {
         return rule.id
     }
 
-    func addBlank() {
+    func createRequestRewrite(from flow: FlowRecord) -> UUID {
+        if let existingID = flow.rewrittenRuleID ?? rules.first(where: {
+            $0.sourceFlowID == flow.id && $0.behavior == .rewriteRequest
+        })?.id {
+            selectedRuleID = existingID
+            return existingID
+        }
+
+        let rule = MappingRule.requestRewrite(from: flow, order: rules.count)
+        rules.append(rule)
+        selectedRuleID = rule.id
+        persistAndNotify()
+        return rule.id
+    }
+
+    func createRequestHeaderRewrite(from flow: FlowRecord) -> UUID {
+        if let existingID = flow.rewrittenRuleID ?? rules.first(where: {
+            $0.sourceFlowID == flow.id && $0.behavior == .rewriteRequest
+        })?.id {
+            selectedRuleID = existingID
+            return existingID
+        }
+
+        var rule = MappingRule.requestRewrite(from: flow, order: rules.count)
+        rule.rewriteBody = false
+        rules.append(rule)
+        selectedRuleID = rule.id
+        persistAndNotify()
+        return rule.id
+    }
+
+    /// Creates a local response mapping for a captured flow, or updates the
+    /// mapping that produced it. This keeps repeated Tree edits attached to a
+    /// single rule instead of adding a new mock for every field change.
+    func upsertResponseBody(_ responseBody: BodyPayload, from flow: FlowRecord) -> UUID {
+        let existingID = flow.mappedRuleID ?? rules.first(where: {
+            $0.sourceFlowID == flow.id && $0.behavior == .localResponse
+        })?.id
+        if let existingID,
+           let index = rules.firstIndex(where: { $0.id == existingID }) {
+            rules[index].responseBody = responseBody
+            selectedRuleID = existingID
+            persistAndNotify()
+            return existingID
+        }
+
+        var rule = MappingRule.from(flow: flow, order: rules.count)
+        rule.responseBody = responseBody
+        rules.append(rule)
+        selectedRuleID = rule.id
+        persistAndNotify()
+        return rule.id
+    }
+
+    /// Creates a request rewrite for a captured flow, or updates the request
+    /// rewrite that produced it. Tree edits rewrite only the body so unrelated
+    /// dynamic headers continue to pass through unchanged.
+    func upsertRequestBody(_ requestBody: BodyPayload, from flow: FlowRecord) -> UUID {
+        let existingID = flow.rewrittenRuleID ?? rules.first(where: {
+            $0.sourceFlowID == flow.id && $0.behavior == .rewriteRequest
+        })?.id
+        if let existingID,
+           let index = rules.firstIndex(where: { $0.id == existingID }) {
+            rules[index].behavior = .rewriteRequest
+            rules[index].rewriteBody = true
+            rules[index].requestBody = requestBody
+            selectedRuleID = existingID
+            persistAndNotify()
+            return existingID
+        }
+
+        var rule = MappingRule.requestRewrite(from: flow, order: rules.count)
+        rule.rewriteHeaders = false
+        rule.requestHeaders = []
+        rule.rewriteBody = true
+        rule.requestBody = requestBody
+        rules.append(rule)
+        selectedRuleID = rule.id
+        persistAndNotify()
+        return rule.id
+    }
+
+    func addBlank(behavior: MappingBehavior = .localResponse) {
         let rule = MappingRule(
             id: UUID(),
-            name: "New mapping",
+            name: behavior == .localResponse ? "New local response" : "New request rewrite",
             enabled: true,
             order: rules.count,
             method: "GET",
@@ -57,7 +139,12 @@ final class MappingStore {
             statusCode: 200,
             responseHeaders: [HeaderField(name: "Content-Type", value: "application/json")],
             responseBody: BodyPayload(data: Data("{}".utf8), isText: true, truncated: false, mimeType: "application/json"),
-            sourceFlowID: nil
+            sourceFlowID: nil,
+            behavior: behavior,
+            rewriteHeaders: behavior == .rewriteRequest,
+            requestHeaders: [],
+            rewriteBody: false,
+            requestBody: .empty
         )
         rules.append(rule)
         selectedRuleID = rule.id

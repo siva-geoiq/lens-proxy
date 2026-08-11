@@ -40,7 +40,8 @@ class LensAddon:
 
     def request(self, flow: http.HTTPFlow):
         self.remove_conditional_cache_headers(flow)
-        self.apply_mapping(flow)
+        self.apply_request_rewrite(flow)
+        self.apply_response_mapping(flow)
         self.flows[flow.id] = flow
         self.emit_flow(flow)
 
@@ -140,12 +141,14 @@ class LensAddon:
             if name in flow.request.headers:
                 del flow.request.headers[name]
 
-    def apply_mapping(self, flow: http.HTTPFlow):
+    def matching_rules(self, flow: http.HTTPFlow, behavior):
         request = flow.request
         split = urllib.parse.urlsplit(request.pretty_url)
         request_port = request.port or (443 if request.scheme == "https" else 80)
         for rule in self.mappings:
             if not rule.get("enabled", True):
+                continue
+            if rule.get("behavior", "localResponse") != behavior:
                 continue
             if rule.get("method", "").upper() != request.method.upper():
                 continue
@@ -159,6 +162,34 @@ class LensAddon:
                 continue
             if rule.get("matchQuery", False) and (rule.get("query") or "") != (split.query or ""):
                 continue
+            yield rule
+
+    def apply_request_rewrite(self, flow: http.HTTPFlow):
+        request = flow.request
+        for rule in self.matching_rules(flow, "rewriteRequest"):
+            rewrite_body = bool(rule.get("rewriteBody", False))
+            if rule.get("rewriteHeaders", False):
+                blocked = {"content-length", "transfer-encoding", "host"}
+                if rewrite_body:
+                    blocked.add("content-encoding")
+                request.headers = http.Headers([
+                    (item.get("name", "").encode("latin-1"), item.get("value", "").encode("latin-1"))
+                    for item in rule.get("requestHeaders", [])
+                    if item.get("name") and item.get("name", "").lower() not in blocked
+                ])
+            if rewrite_body:
+                body = rule.get("requestBody") or {}
+                body_data = base64.b64decode(body.get("data", ""))
+                request.headers.pop("content-encoding", None)
+                request.headers.pop("transfer-encoding", None)
+                request.headers.pop("content-length", None)
+                request.content = body_data
+            flow.metadata["lens_rewrite_id"] = rule.get("id")
+            flow.metadata["lens_rewrite_name"] = rule.get("name")
+            break
+
+    def apply_response_mapping(self, flow: http.HTTPFlow):
+        for rule in self.matching_rules(flow, "localResponse"):
             body = rule.get("responseBody") or {}
             body_data = base64.b64decode(body.get("data", ""))
             headers = http.Headers([
@@ -236,6 +267,8 @@ class LensAddon:
             "size": len(response.raw_content or b"") if response else 0,
             "mappedRuleID": flow.metadata.get("lens_mapping_id"),
             "mappedRuleName": flow.metadata.get("lens_mapping_name"),
+            "rewrittenRuleID": flow.metadata.get("lens_rewrite_id"),
+            "rewrittenRuleName": flow.metadata.get("lens_rewrite_name"),
             "error": flow.error.msg if flow.error else None,
             "websocketMessages": websocket_messages,
         }

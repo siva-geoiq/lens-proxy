@@ -26,7 +26,11 @@ struct MappingManagerView: View {
                             .toggleStyle(.switch)
                             .labelsHidden()
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(rule.name).lineLimit(1)
+                                HStack(spacing: 5) {
+                                    Image(systemName: rule.behavior.systemImage)
+                                        .foregroundStyle(rule.behavior == .rewriteRequest ? .blue : .orange)
+                                    Text(rule.name).lineLimit(1)
+                                }
                                 Text(rule.matchSummary)
                                     .font(.caption2.monospaced())
                                     .foregroundStyle(.secondary)
@@ -45,9 +49,16 @@ struct MappingManagerView: View {
             .navigationSplitViewColumnWidth(min: 280, ideal: 340)
             .toolbar {
                 ToolbarItemGroup {
-                    Button { mappings.addBlank() } label: { Image(systemName: "plus") }
+                    Menu {
+                        Button("Local Response", systemImage: MappingBehavior.localResponse.systemImage) {
+                            mappings.addBlank(behavior: .localResponse)
+                        }
+                        Button("Request Rewrite", systemImage: MappingBehavior.rewriteRequest.systemImage) {
+                            mappings.addBlank(behavior: .rewriteRequest)
+                        }
+                    } label: { Image(systemName: "plus") }
                         .accessibilityLabel("Add mapping")
-                        .help("Add local mapping")
+                        .help("Add a local response or request rewrite")
                     Button {
                         if let id = mappings.selectedRuleID { mappings.remove(id) }
                     } label: { Image(systemName: "trash") }
@@ -67,7 +78,7 @@ struct MappingManagerView: View {
         }
         .safeAreaInset(edge: .bottom) {
             HStack {
-                Text("First enabled matching rule wins.")
+                Text("First enabled matching rule of each behavior wins.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -81,12 +92,14 @@ struct MappingManagerView: View {
 
 private struct MappingEditorView: View {
     @State private var draft: MappingRule
-    @State private var bodyText: String
+    @State private var responseBodyText: String
+    @State private var requestBodyText: String
     let onSave: (MappingRule) -> Void
 
     init(rule: MappingRule, onSave: @escaping (MappingRule) -> Void) {
         _draft = State(initialValue: rule)
-        _bodyText = State(initialValue: rule.responseBody.formattedText)
+        _responseBodyText = State(initialValue: rule.responseBody.formattedText)
+        _requestBodyText = State(initialValue: rule.requestBody.formattedText)
         self.onSave = onSave
     }
 
@@ -95,6 +108,12 @@ private struct MappingEditorView: View {
             Form {
                 TextField("Name", text: $draft.name)
                 Toggle("Enabled", isOn: $draft.enabled)
+                Picker("Behavior", selection: $draft.behavior) {
+                    ForEach(MappingBehavior.allCases) { behavior in
+                        Label(behavior.title, systemImage: behavior.systemImage).tag(behavior)
+                    }
+                }
+                .pickerStyle(.segmented)
                 LabeledContent("Request") {
                     HStack {
                         TextField("Method", text: $draft.method).frame(width: 80)
@@ -108,26 +127,52 @@ private struct MappingEditorView: View {
                 if draft.matchQuery {
                     TextField("Query", text: Binding($draft.query, replacingNilWith: ""))
                 }
-                TextField("Response status", value: $draft.statusCode, format: .number)
+                if draft.behavior == .localResponse {
+                    TextField("Response status", value: $draft.statusCode, format: .number)
+                } else {
+                    Toggle("Replace request headers", isOn: $draft.rewriteHeaders)
+                    Toggle("Replace request body", isOn: $draft.rewriteBody)
+                }
             }
             .formStyle(.grouped)
             .frame(maxHeight: 300)
             Divider()
             HSplitView {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Response headers").font(.headline)
-                    HeaderEditor(headers: $draft.responseHeaders)
-                }
-                .padding(10)
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Response body").font(.headline)
-                        Spacer()
-                        Text(draft.responseBody.mimeType ?? "Unknown type").foregroundStyle(.secondary)
+                if draft.behavior == .localResponse {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Response headers").font(.headline)
+                        HeaderEditor(headers: $draft.responseHeaders, subject: "response")
                     }
-                    CodeTextView(text: $bodyText, isEditable: draft.responseBody.isText)
+                    .padding(10)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Response body").font(.headline)
+                            Spacer()
+                            Text(draft.responseBody.mimeType ?? "Unknown type").foregroundStyle(.secondary)
+                        }
+                        CodeTextView(text: $responseBodyText, isEditable: draft.responseBody.isText)
+                    }
+                    .padding(10)
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Request headers").font(.headline)
+                        HeaderEditor(headers: $draft.requestHeaders, subject: "request")
+                            .disabled(!draft.rewriteHeaders)
+                    }
+                    .padding(10)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Request body").font(.headline)
+                            Spacer()
+                            Text(draft.requestBody.mimeType ?? "Unknown type").foregroundStyle(.secondary)
+                        }
+                        CodeTextView(
+                            text: $requestBodyText,
+                            isEditable: draft.rewriteBody && draft.requestBody.isText
+                        )
+                    }
+                    .padding(10)
                 }
-                .padding(10)
             }
             Divider()
             HStack {
@@ -141,12 +186,16 @@ private struct MappingEditorView: View {
     }
 
     private func resetBody() {
-        bodyText = draft.responseBody.formattedText
+        responseBodyText = draft.responseBody.formattedText
+        requestBodyText = draft.requestBody.formattedText
     }
 
     private func save() {
         if draft.responseBody.isText {
-            draft.responseBody.data = Data(bodyText.utf8)
+            draft.responseBody.data = Data(responseBodyText.utf8)
+        }
+        if draft.requestBody.isText {
+            draft.requestBody.data = Data(requestBodyText.utf8)
         }
         draft.method = draft.method.uppercased()
         if !draft.path.hasPrefix("/") { draft.path = "/" + draft.path }
@@ -156,6 +205,7 @@ private struct MappingEditorView: View {
 
 private struct HeaderEditor: View {
     @Binding var headers: [HeaderField]
+    let subject: String
 
     var body: some View {
         List {
@@ -168,7 +218,7 @@ private struct HeaderEditor: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Remove header")
-                    .help("Remove response header")
+                    .help("Remove \(subject) header")
                 }
             }
         }

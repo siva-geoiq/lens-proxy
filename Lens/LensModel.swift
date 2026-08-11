@@ -16,6 +16,9 @@ final class LensModel {
     private let bridge: BridgeClient
     private let logger = Logger(subsystem: "com.lenskart.lens.Lens", category: "Attachment")
     private var devicePreparationTask: Task<Void, Never>?
+    private var allowsAutomaticDeviceSync = true
+    private var isPreparingDevices = false
+    private var isAutoSyncingRememberedDevices = false
 
     var engineState: EngineState = .stopped
     var engineLog = ""
@@ -54,9 +57,16 @@ final class LensModel {
             }
         }
         mappings.onRulesChanged = { [weak self] rules in self?.sendMappings(rules) }
+        devices.onDevicesChanged = { [weak self] devices in
+            guard let self else { return }
+            self.captures.attributeFlows(to: devices)
+            Task { await self.autoAttachRememberedDevices() }
+        }
     }
 
     func startEngine() {
+        allowsAutomaticDeviceSync = true
+        devices.startMonitoring()
         switch engineState {
         case .stopped, .failed:
             break
@@ -66,7 +76,9 @@ final class LensModel {
         lastError = nil
         engineState = .starting
         devicePreparationTask?.cancel()
+        isPreparingDevices = true
         devicePreparationTask = Task {
+            defer { self.isPreparingDevices = false }
             for attempt in 0..<10 {
                 await refreshDevices(autoAttachRememberedDevice: false)
                 if !devices.devices.isEmpty || Task.isCancelled { break }
@@ -76,7 +88,7 @@ final class LensModel {
             await devices.recoverPreviousAttachments()
             captures.attributeFlows(to: devices.devices)
             logger.info("Device preparation completed with \(self.devices.devices.count) connected device(s)")
-            await autoAttachRememberedEmulator()
+            await autoAttachRememberedDevices(allowDuringPreparation: true)
         }
         do {
             _ = try engine.start(
@@ -149,25 +161,23 @@ final class LensModel {
 
     func refreshDevices(autoAttachRememberedDevice: Bool = true) async {
         await devices.refresh()
-        captures.attributeFlows(to: devices.devices)
         if autoAttachRememberedDevice {
-            await autoAttachRememberedEmulator()
+            await autoAttachRememberedDevices()
         }
     }
 
     func stopEngine() {
+        allowsAutomaticDeviceSync = false
         bridge.send(type: "shutdown")
         engine.stop()
         bridge.disconnect()
         engineState = .stopped
     }
 
-    func applyEngineSettings(proxyPort: Int, mitmdumpPath: String?) {
-        let currentMitmdumpPath = UserDefaults.standard.string(forKey: "mitmdumpPath")
-        let shouldRestart = engine.isRunning && (self.proxyPort != proxyPort || currentMitmdumpPath != mitmdumpPath)
+    func applyEngineSettings(proxyPort: Int) {
+        let shouldRestart = engine.isRunning && self.proxyPort != proxyPort
         self.proxyPort = proxyPort
         UserDefaults.standard.set(proxyPort, forKey: "proxyPort")
-        UserDefaults.standard.set(mitmdumpPath, forKey: "mitmdumpPath")
         if shouldRestart {
             stopEngine()
             Task {
@@ -206,6 +216,47 @@ final class LensModel {
         showingMappings = true
     }
 
+    func rewriteSelectedRequest() {
+        guard let flow = captures.selectedFlow else { return }
+        _ = mappings.createRequestRewrite(from: flow)
+        showingMappings = true
+    }
+
+    @discardableResult
+    func createRequestHeaderRewrite(for flow: FlowRecord) -> UUID {
+        mappings.createRequestHeaderRewrite(from: flow)
+    }
+
+    @discardableResult
+    func updateMockResponse(for flow: FlowRecord, json: JSONValue) -> UUID? {
+        do {
+            var responseBody = flow.responseBody ?? .empty
+            responseBody.data = try json.encodedJSON()
+            responseBody.isText = true
+            responseBody.truncated = false
+            responseBody.mimeType = responseBody.mimeType ?? "application/json"
+            return mappings.upsertResponseBody(responseBody, from: flow)
+        } catch {
+            lastError = "Could not update the JSON mock: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    @discardableResult
+    func updateRequestRewrite(for flow: FlowRecord, json: JSONValue) -> UUID? {
+        do {
+            var requestBody = flow.requestBody ?? .empty
+            requestBody.data = try json.encodedJSON()
+            requestBody.isText = true
+            requestBody.truncated = false
+            requestBody.mimeType = requestBody.mimeType ?? "application/json"
+            return mappings.upsertRequestBody(requestBody, from: flow)
+        } catch {
+            lastError = "Could not update the request rewrite: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     func saveSession() {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.data]
@@ -223,6 +274,10 @@ final class LensModel {
 
     func attach(_ device: DeviceTarget, stopConflictingVPN: Bool = false) {
         guard attachingDeviceID == nil else { return }
+        guard case .running = engineState else {
+            lastError = "Wait for the Lens proxy engine to finish starting before attaching a device."
+            return
+        }
         Task {
             await attachDevice(device, stopConflictingVPN: stopConflictingVPN)
         }
@@ -239,6 +294,9 @@ final class LensModel {
     }
 
     func shutdown() async {
+        allowsAutomaticDeviceSync = false
+        devicePreparationTask?.cancel()
+        devices.stopMonitoring()
         await devices.restoreAttachedDevicesAndWait()
         stopEngine()
     }
@@ -283,13 +341,15 @@ final class LensModel {
                 engineState = .running(port: proxyPort)
                 sendMappings(mappings.rules)
                 bridge.send(type: "setNoCaching", payload: ["enabled": isNoCachingEnabled])
+                Task { await autoAttachRememberedDevices() }
             case "flowUpsert":
                 guard let payload = envelope.payload else { return }
                 let flow = try payload.decode(FlowRecord.self)
                 let pathWithoutQuery = String(flow.path.split(separator: "?", maxSplits: 1).first ?? "")
                 let mappingName = flow.mappedRuleName ?? "none"
+                let rewriteName = flow.rewrittenRuleName ?? "none"
                 logger.info(
-                    "Captured \(flow.method, privacy: .public) \(flow.host, privacy: .public)\(pathWithoutQuery, privacy: .public) status \(flow.responseStatus ?? -1) mapping \(mappingName, privacy: .public)"
+                    "Captured \(flow.method, privacy: .public) \(flow.host, privacy: .public)\(pathWithoutQuery, privacy: .public) status \(flow.responseStatus ?? -1) mapping \(mappingName, privacy: .public) rewrite \(rewriteName, privacy: .public)"
                 )
                 captures.upsert(captures.attributed(flow, to: devices.devices))
             case "sessionReset":
@@ -319,31 +379,33 @@ final class LensModel {
         bridge.send(type: "setMappings", payload: ["rules": rules])
     }
 
-    private func autoAttachRememberedEmulator() async {
+    private func autoAttachRememberedDevices(allowDuringPreparation: Bool = false) async {
+        guard allowsAutomaticDeviceSync else { return }
+        guard allowDuringPreparation || !isPreparingDevices else { return }
         guard engineCanAcceptDeviceTraffic else {
             logger.notice("Skipping auto-attach because the proxy engine is unavailable")
             return
         }
-        guard let serial = devices.lastAttachedEmulatorSerial else {
-            logger.info("Skipping auto-attach because no emulator is remembered")
-            return
+        guard attachingDeviceID == nil, !isAutoSyncingRememberedDevices else { return }
+        let targets = devices.rememberedDetachedDevices
+        guard !targets.isEmpty else { return }
+
+        isAutoSyncingRememberedDevices = true
+        defer { isAutoSyncingRememberedDevices = false }
+        for rememberedTarget in targets {
+            guard allowsAutomaticDeviceSync, engineCanAcceptDeviceTraffic else { break }
+            guard let currentTarget = devices.devices.first(where: {
+                $0.aliasKey == rememberedTarget.aliasKey && !$0.isAttached
+            }) else { continue }
+            logger.info("Auto-syncing remembered device \(currentTarget.serial, privacy: .public)")
+            await attachDevice(currentTarget)
         }
-        guard let target = devices.devices.first(where: { $0.serial == serial && !$0.isAttached }) else {
-            logger.notice("Remembered emulator \(serial, privacy: .public) is unavailable or already attached")
-            return
-        }
-        guard attachingDeviceID == nil else {
-            logger.info("Skipping duplicate auto-attach for \(serial, privacy: .public)")
-            return
-        }
-        logger.info("Auto-attaching remembered emulator \(serial, privacy: .public)")
-        await attachDevice(target)
     }
 
     private var engineCanAcceptDeviceTraffic: Bool {
         switch engineState {
-        case .starting, .running: true
-        case .stopped, .failed: false
+        case .running: true
+        case .starting, .stopped, .failed: false
         }
     }
 

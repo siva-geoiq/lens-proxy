@@ -53,6 +53,10 @@ struct LensApp: App {
                 Button("Save Session…") { model.saveSession() }
                     .keyboardShortcut("s", modifiers: .command)
             }
+            CommandGroup(after: .textEditing) {
+                Button("Find in All Flows") { model.captures.presentGlobalSearch() }
+                    .keyboardShortcut("f", modifiers: .command)
+            }
             CommandMenu("Proxy") {
                 Button(model.captures.isCapturePaused ? "Resume Capture" : "Pause Capture") { model.toggleCapture() }
                     .keyboardShortcut("b", modifiers: .command)

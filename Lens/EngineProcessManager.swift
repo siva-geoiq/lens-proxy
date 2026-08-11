@@ -2,6 +2,9 @@ import Darwin
 import Foundation
 
 final class EngineProcessManager: @unchecked Sendable {
+    static let bundledRuntimeRelativePath = LensRuntimePaths.bundledMitmdumpRelativePath
+
+    private let runtimePaths: LensRuntimePaths
     private var process: Process?
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
@@ -9,6 +12,10 @@ final class EngineProcessManager: @unchecked Sendable {
     private var outputBuffer = ""
 
     var isRunning: Bool { process?.isRunning == true }
+
+    init(runtimePaths: LensRuntimePaths = .live()) {
+        self.runtimePaths = runtimePaths
+    }
 
     func start(
         proxyPort: Int,
@@ -18,11 +25,18 @@ final class EngineProcessManager: @unchecked Sendable {
     ) throws -> String {
         guard process?.isRunning != true else { throw EngineProcessError.alreadyRunning }
         guard isPortAvailable(proxyPort) else { throw EngineProcessError.portInUse(proxyPort) }
-        guard let executable = locateMitmdump() else { throw EngineProcessError.mitmdumpNotFound }
+        guard let executable = runtimePaths.bundledMitmdumpURL() else {
+            throw EngineProcessError.bundledRuntimeMissing
+        }
         guard let addonURL = Bundle.main.url(forResource: "lens_addon", withExtension: "py") else {
             throw EngineProcessError.addonNotFound
         }
 
+        do {
+            try runtimePaths.prepare()
+        } catch {
+            throw EngineProcessError.runtimeStorageUnavailable(error.localizedDescription)
+        }
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let process = Process()
         let outputPipe = Pipe()
@@ -31,6 +45,7 @@ final class EngineProcessManager: @unchecked Sendable {
         process.arguments = [
             "--listen-host", "0.0.0.0",
             "--listen-port", String(proxyPort),
+            "--set", "confdir=\(runtimePaths.mitmproxyConfigurationDirectory.path)",
             "--set", "block_global=false",
             "--set", "websocket=true",
             "--scripts", addonURL.path
@@ -107,15 +122,14 @@ final class EngineProcessManager: @unchecked Sendable {
         }
     }
 
-    private func locateMitmdump() -> URL? {
-        let candidates = [
-            UserDefaults.standard.string(forKey: "mitmdumpPath"),
-            "/opt/homebrew/bin/mitmdump",
-            "/usr/local/bin/mitmdump"
-        ].compactMap { $0 }
-        return candidates
-            .map(URL.init(fileURLWithPath:))
-            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    static func bundledMitmdumpURL(
+        in applicationBundleURL: URL,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        LensRuntimePaths(
+            applicationBundleURL: applicationBundleURL,
+            applicationSupportDirectory: fileManager.temporaryDirectory
+        ).bundledMitmdumpURL(fileManager: fileManager)
     }
 
     private func isPortAvailable(_ port: Int) -> Bool {
@@ -148,14 +162,16 @@ final class EngineProcessManager: @unchecked Sendable {
 
 enum EngineProcessError: LocalizedError {
     case alreadyRunning
-    case mitmdumpNotFound
+    case bundledRuntimeMissing
+    case runtimeStorageUnavailable(String)
     case addonNotFound
     case portInUse(Int)
 
     var errorDescription: String? {
         switch self {
         case .alreadyRunning: "mitmdump is already running."
-        case .mitmdumpNotFound: "mitmdump was not found. Install mitmproxy with Homebrew or select its path in Settings."
+        case .bundledRuntimeMissing: "The bundled mitmproxy runtime is missing or cannot be executed. Reinstall Lens."
+        case let .runtimeStorageUnavailable(message): "Lens could not prepare its proxy storage: \(message)"
         case .addonNotFound: "The Lens mitmproxy addon is missing from the application bundle."
         case let .portInUse(port): "Port \(port) is already in use. Stop the conflicting proxy or select another port in Settings."
         }

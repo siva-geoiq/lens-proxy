@@ -2,10 +2,57 @@ import SwiftUI
 
 struct FlowFilterBar: View {
     @Environment(LensModel.self) private var model
+    @FocusState private var isGlobalSearchFocused: Bool
 
     var body: some View {
         @Bindable var captures = model.captures
         VStack(spacing: 8) {
+            if captures.isGlobalSearchPresented {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    TextField(
+                        "Search URLs, metadata, headers, bodies, cURL, and WebSockets",
+                        text: $captures.searchText
+                    )
+                    .textFieldStyle(.plain)
+                    .focused($isGlobalSearchFocused)
+                    .task(id: captures.globalSearchFocusRequest) {
+                        await Task.yield()
+                        guard !Task.isCancelled, captures.isGlobalSearchPresented else { return }
+                        isGlobalSearchFocused = true
+                    }
+                    .onExitCommand { captures.dismissGlobalSearch() }
+                    if captures.isGlobalSearchActive {
+                        Text("\(captures.filteredFlows.count) matches")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .fixedSize()
+                    }
+                    if !captures.searchText.isEmpty {
+                        Button { captures.searchText = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Clear global search")
+                        .help("Clear global search")
+                    }
+                    Button { captures.dismissGlobalSearch() } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Close global search")
+                    .help("Close global search (Escape)")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                .accessibilityElement(children: .contain)
+            }
             HStack(spacing: 16) {
                 ForEach(FlowKind.allCases) { kind in
                     Button(kind.rawValue) { captures.selectedKind = kind }
@@ -18,21 +65,6 @@ struct FlowFilterBar: View {
                 }
                 Spacer()
             }
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Filter by URL, method, or status", text: $captures.searchText)
-                    .textFieldStyle(.plain)
-                if !captures.searchText.isEmpty {
-                    Button { captures.searchText = "" } label: { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("Clear request filter")
-                        .help("Clear request filter")
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
         }
         .padding(10)
     }
@@ -58,14 +90,24 @@ struct FlowTableView: View {
     var body: some View {
         GeometryReader { proxy in
             let urlWidth = max(260, proxy.size.width - ColumnWidth.fixed)
+            let filteredFlows = model.captures.filteredFlows
 
             VStack(spacing: 0) {
                 flowHeader(urlWidth: urlWidth)
                 Divider()
-                ScrollView(.vertical) {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(model.captures.filteredFlows.enumerated()), id: \.element.id) { index, flow in
-                            flowRow(flow, index: index, urlWidth: urlWidth)
+                if model.captures.isGlobalSearchActive, filteredFlows.isEmpty {
+                    ContentUnavailableView(
+                        "No Search Results",
+                        systemImage: "magnifyingglass",
+                        description: Text("No request or response content matches this query.")
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView(.vertical) {
+                        LazyVStack(spacing: 0) {
+                            ForEach(Array(filteredFlows.enumerated()), id: \.element.id) { index, flow in
+                                flowRow(flow, index: index, urlWidth: urlWidth)
+                            }
                         }
                     }
                 }
@@ -92,13 +134,17 @@ struct FlowTableView: View {
     private func flowRow(_ flow: FlowRecord, index: Int, urlWidth: CGFloat) -> some View {
         HStack(spacing: 0) {
             Circle()
-                .fill(flow.error == nil ? (flow.mappedRuleID == nil ? Color.green : Color.orange) : Color.red)
+                .fill(flowIndicatorColor(flow))
                 .frame(width: 8, height: 8)
                 .frame(width: ColumnWidth.indicator)
             HStack(spacing: 6) {
                 if flow.mappedRuleID != nil {
                     Image(systemName: "arrow.triangle.branch")
                         .foregroundStyle(.orange)
+                }
+                if flow.rewrittenRuleID != nil {
+                    Image(systemName: "arrow.right.arrow.left")
+                        .foregroundStyle(.blue)
                 }
                 Text(flow.displayURL)
                     .font(.system(.body, design: .monospaced))
@@ -129,6 +175,10 @@ struct FlowTableView: View {
             model.captures.selectedFlowID = flow.id
         }
         .contextMenu {
+            Button("Rewrite Request") {
+                model.captures.selectedFlowID = flow.id
+                model.rewriteSelectedRequest()
+            }
             Button("Map Local Response") {
                 model.captures.selectedFlowID = flow.id
                 model.mapSelectedFlow()
@@ -161,6 +211,13 @@ struct FlowTableView: View {
         if status >= 500 { return .red }
         if status >= 400 { return .orange }
         if status >= 300 { return .blue }
+        return .green
+    }
+
+    private func flowIndicatorColor(_ flow: FlowRecord) -> Color {
+        if flow.error != nil { return .red }
+        if flow.mappedRuleID != nil { return .orange }
+        if flow.rewrittenRuleID != nil { return .blue }
         return .green
     }
 }

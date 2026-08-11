@@ -9,7 +9,7 @@ struct DeviceAttachmentBanner: View {
             Label("Device detached", systemImage: "exclamationmark.triangle.fill")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.orange)
-            Text("\(device.model) traffic is not routed through Lens.")
+            Text("\(device.displayName) traffic is not routed through Lens.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -28,7 +28,7 @@ struct DeviceAttachmentBanner: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(model.attachingDeviceID != nil || !engineIsRunning)
-            .help("Route \(device.model) through Lens")
+            .help("Route \(device.displayName) through Lens")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

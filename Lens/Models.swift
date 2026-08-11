@@ -90,6 +90,8 @@ struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
     var size: Int
     var mappedRuleID: UUID?
     var mappedRuleName: String?
+    var rewrittenRuleID: UUID? = nil
+    var rewrittenRuleName: String? = nil
     var error: String?
     var websocketMessages: [WebSocketFrame]
     var deviceID: String? = nil
@@ -111,6 +113,107 @@ struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
 
     var bodyByteCount: Int {
         (requestBody?.data.count ?? 0) + (responseBody?.data.count ?? 0)
+    }
+
+    func matchesGlobalSearch(_ rawQuery: String) -> Bool {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+
+        var metadata = [
+            id,
+            clientAddress,
+            clientDisplayName,
+            method,
+            scheme,
+            host,
+            String(port),
+            path,
+            url,
+            displayURL,
+            statusText,
+            String(size),
+            String(startedAt),
+            "\(method) \(path) HTTP",
+            "curl -X \(method)",
+            "curl --request \(method)",
+            "curl --url \(url)"
+        ]
+        let optionalMetadata: [String?] = [
+            deviceID,
+            deviceName,
+            responseStatus.map { String($0) },
+            responseReason,
+            endedAt.map { String($0) },
+            duration.map { String($0) },
+            mappedRuleID?.uuidString,
+            mappedRuleName,
+            error,
+            requestBody?.mimeType,
+            responseBody?.mimeType
+        ]
+        metadata.append(contentsOf: optionalMetadata.compactMap { $0 })
+
+        if metadata.contains(where: { $0.localizedCaseInsensitiveContains(query) }) {
+            return true
+        }
+        if headersContain(requestHeaders, query: query, curlFlag: "-H") ||
+            headersContain(responseHeaders, query: query, curlFlag: nil) {
+            return true
+        }
+        if bodyContains(requestBody, query: query, curlFlag: requestBody?.isText == true ? "--data-raw" : "--data-binary") ||
+            bodyContains(responseBody, query: query, curlFlag: nil) {
+            return true
+        }
+        return websocketMessages.contains { frame in
+            frame.content.localizedCaseInsensitiveContains(query) ||
+                (frame.fromClient ? "client request outgoing" : "server response incoming")
+                .localizedCaseInsensitiveContains(query) ||
+                String(frame.timestamp).localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private func headersContain(_ headers: [HeaderField], query: String, curlFlag: String?) -> Bool {
+        headers.contains { header in
+            let rawHeader = "\(header.name): \(header.value)"
+            return header.name.localizedCaseInsensitiveContains(query) ||
+                header.value.localizedCaseInsensitiveContains(query) ||
+                rawHeader.localizedCaseInsensitiveContains(query) ||
+                curlFlag.map { "\($0) '\(rawHeader)'".localizedCaseInsensitiveContains(query) } == true
+        }
+    }
+
+    private func bodyContains(_ body: BodyPayload?, query: String, curlFlag: String?) -> Bool {
+        guard let body else { return false }
+        if body.mimeType?.localizedCaseInsensitiveContains(query) == true ||
+            (body.truncated && "truncated evicted".localizedCaseInsensitiveContains(query)) ||
+            curlFlag?.localizedCaseInsensitiveContains(query) == true {
+            return true
+        }
+        if let text = body.text {
+            return text.localizedCaseInsensitiveContains(query)
+        }
+        return body.hexPreview.localizedCaseInsensitiveContains(query)
+    }
+}
+
+enum MappingBehavior: String, Codable, CaseIterable, Identifiable, Sendable {
+    case localResponse
+    case rewriteRequest
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .localResponse: "Local Response"
+        case .rewriteRequest: "Request Rewrite"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .localResponse: "arrow.turn.down.left"
+        case .rewriteRequest: "arrow.right.arrow.left"
+        }
     }
 }
 
@@ -149,6 +252,85 @@ struct MappingRule: Codable, Hashable, Identifiable, Sendable {
     var responseHeaders: [HeaderField]
     var responseBody: BodyPayload
     var sourceFlowID: String?
+    var behavior: MappingBehavior
+    var rewriteHeaders: Bool
+    var requestHeaders: [HeaderField]
+    var rewriteBody: Bool
+    var requestBody: BodyPayload
+
+    init(
+        id: UUID,
+        name: String,
+        enabled: Bool,
+        order: Int,
+        method: String,
+        scheme: String,
+        host: String,
+        port: Int,
+        path: String,
+        matchQuery: Bool,
+        query: String?,
+        statusCode: Int,
+        responseHeaders: [HeaderField],
+        responseBody: BodyPayload,
+        sourceFlowID: String?,
+        behavior: MappingBehavior = .localResponse,
+        rewriteHeaders: Bool = false,
+        requestHeaders: [HeaderField] = [],
+        rewriteBody: Bool = false,
+        requestBody: BodyPayload = .empty
+    ) {
+        self.id = id
+        self.name = name
+        self.enabled = enabled
+        self.order = order
+        self.method = method
+        self.scheme = scheme
+        self.host = host
+        self.port = port
+        self.path = path
+        self.matchQuery = matchQuery
+        self.query = query
+        self.statusCode = statusCode
+        self.responseHeaders = responseHeaders
+        self.responseBody = responseBody
+        self.sourceFlowID = sourceFlowID
+        self.behavior = behavior
+        self.rewriteHeaders = rewriteHeaders
+        self.requestHeaders = requestHeaders
+        self.rewriteBody = rewriteBody
+        self.requestBody = requestBody
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, enabled, order, method, scheme, host, port, path
+        case matchQuery, query, statusCode, responseHeaders, responseBody, sourceFlowID
+        case behavior, rewriteHeaders, requestHeaders, rewriteBody, requestBody
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        order = try container.decode(Int.self, forKey: .order)
+        method = try container.decode(String.self, forKey: .method)
+        scheme = try container.decode(String.self, forKey: .scheme)
+        host = try container.decode(String.self, forKey: .host)
+        port = try container.decode(Int.self, forKey: .port)
+        path = try container.decode(String.self, forKey: .path)
+        matchQuery = try container.decode(Bool.self, forKey: .matchQuery)
+        query = try container.decodeIfPresent(String.self, forKey: .query)
+        statusCode = try container.decodeIfPresent(Int.self, forKey: .statusCode) ?? 200
+        responseHeaders = try container.decodeIfPresent([HeaderField].self, forKey: .responseHeaders) ?? []
+        responseBody = try container.decodeIfPresent(BodyPayload.self, forKey: .responseBody) ?? .empty
+        sourceFlowID = try container.decodeIfPresent(String.self, forKey: .sourceFlowID)
+        behavior = try container.decodeIfPresent(MappingBehavior.self, forKey: .behavior) ?? .localResponse
+        rewriteHeaders = try container.decodeIfPresent(Bool.self, forKey: .rewriteHeaders) ?? false
+        requestHeaders = try container.decodeIfPresent([HeaderField].self, forKey: .requestHeaders) ?? []
+        rewriteBody = try container.decodeIfPresent(Bool.self, forKey: .rewriteBody) ?? false
+        requestBody = try container.decodeIfPresent(BodyPayload.self, forKey: .requestBody) ?? .empty
+    }
 
     var matchSummary: String {
         let querySuffix = matchQuery && !(query ?? "").isEmpty ? "?\(query ?? "")" : ""
@@ -171,6 +353,11 @@ struct MappingRule: Codable, Hashable, Identifiable, Sendable {
         return headers.filter { !blockedHeaders.contains($0.name.lowercased()) }
     }
 
+    static func sanitizedRequestHeaders(_ headers: [HeaderField]) -> [HeaderField] {
+        let blockedHeaders = Set(["content-length", "transfer-encoding", "host"])
+        return headers.filter { !blockedHeaders.contains($0.name.lowercased()) }
+    }
+
     static func from(flow: FlowRecord, order: Int) -> MappingRule {
         let components = URLComponents(string: flow.url)
         return MappingRule(
@@ -189,6 +376,32 @@ struct MappingRule: Codable, Hashable, Identifiable, Sendable {
             responseHeaders: sanitizedResponseHeaders(flow.responseHeaders),
             responseBody: flow.responseBody ?? .empty,
             sourceFlowID: flow.id
+        )
+    }
+
+    static func requestRewrite(from flow: FlowRecord, order: Int) -> MappingRule {
+        let components = URLComponents(string: flow.url)
+        return MappingRule(
+            id: UUID(),
+            name: "Rewrite \(flow.method) \(flow.host)\(flow.path)",
+            enabled: true,
+            order: order,
+            method: flow.method,
+            scheme: flow.scheme,
+            host: flow.host,
+            port: flow.port,
+            path: components?.path.isEmpty == false ? components?.path ?? flow.path : flow.path,
+            matchQuery: false,
+            query: components?.percentEncodedQuery,
+            statusCode: flow.responseStatus ?? 200,
+            responseHeaders: [],
+            responseBody: .empty,
+            sourceFlowID: flow.id,
+            behavior: .rewriteRequest,
+            rewriteHeaders: true,
+            requestHeaders: sanitizedRequestHeaders(flow.requestHeaders),
+            rewriteBody: flow.requestBody != nil,
+            requestBody: flow.requestBody ?? .empty
         )
     }
 }
@@ -225,6 +438,18 @@ struct DeviceTarget: Codable, Hashable, Identifiable, Sendable {
     var previousProxy: ProxySnapshot?
     var caInstalled: Bool
     var networkAddresses: [String] = []
+    var hardwareID: String? = nil
+    var customName: String? = nil
+
+    var displayName: String {
+        let trimmedName = customName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmedName.isEmpty ? model : trimmedName
+    }
+
+    var aliasKey: String {
+        let trimmedHardwareID = hardwareID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmedHardwareID.isEmpty || trimmedHardwareID == "unknown" ? serial : trimmedHardwareID
+    }
 }
 
 struct BridgeEnvelope: Codable, Sendable {
@@ -240,7 +465,7 @@ struct BridgeErrorPayload: Codable, Sendable {
     var message: String
 }
 
-enum JSONValue: Codable, Sendable {
+enum JSONValue: Codable, Hashable, Sendable {
     case string(String)
     case number(Double)
     case bool(Bool)
@@ -278,6 +503,18 @@ enum JSONValue: Codable, Sendable {
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
         let data = try JSONEncoder().encode(self)
         return try JSONDecoder().decode(type, from: data)
+    }
+
+    static func decodeJSON(from data: Data) throws -> JSONValue {
+        try JSONDecoder().decode(JSONValue.self, from: data)
+    }
+
+    func encodedJSON(prettyPrinted: Bool = true) throws -> Data {
+        let encoder = JSONEncoder()
+        if prettyPrinted {
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        }
+        return try encoder.encode(self)
     }
 }
 

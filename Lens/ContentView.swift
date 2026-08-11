@@ -2,6 +2,9 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(LensModel.self) private var model
+    @State private var fullscreenInspector: InspectorPane?
+    @State private var requestInspectorTab = "Body"
+    @State private var responseInspectorTab = "Body"
 
     var body: some View {
         @Bindable var captures = model.captures
@@ -10,19 +13,24 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 230, ideal: 280, max: 380)
         } detail: {
             VStack(spacing: 0) {
-                if let detachedDevice = model.detachedDevice {
-                    DeviceAttachmentBanner(device: detachedDevice)
+                if fullscreenInspector == nil {
+                    if let detachedDevice = model.detachedDevice {
+                        DeviceAttachmentBanner(device: detachedDevice)
+                        Divider()
+                    }
+                    FlowFilterBar()
                     Divider()
+                    VSplitView {
+                        FlowTableView()
+                            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 220)
+                        flowInspector(flow: captures.selectedFlow)
+                            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 260)
+                    }
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                } else {
+                    flowInspector(flow: captures.selectedFlow)
+                        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
                 }
-                FlowFilterBar()
-                Divider()
-                VSplitView {
-                    FlowTableView()
-                        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 220)
-                    FlowInspectorView(flow: captures.selectedFlow)
-                        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 260)
-                }
-                .frame(minWidth: 0, maxWidth: .infinity)
                 Divider()
                 StatusBarView()
             }
@@ -52,6 +60,20 @@ struct ContentView: View {
         } message: {
             Text(model.lastError ?? "")
         }
+        .onChange(of: captures.selectedFlowID) {
+            fullscreenInspector = nil
+            requestInspectorTab = "Body"
+            responseInspectorTab = "Body"
+        }
+    }
+
+    private func flowInspector(flow: FlowRecord?) -> some View {
+        FlowInspectorView(
+            flow: flow,
+            fullscreenPane: $fullscreenInspector,
+            requestSelectedTab: $requestInspectorTab,
+            responseSelectedTab: $responseInspectorTab
+        )
     }
 
     @ToolbarContentBuilder
@@ -72,10 +94,15 @@ struct ContentView: View {
             EngineStatusView()
         }
         ToolbarItemGroup(placement: .primaryAction) {
+            Button { model.captures.presentGlobalSearch() } label: {
+                Label("Search All Flows", systemImage: "magnifyingglass")
+            }
+            .help("Search all captured requests and responses (Command-F)")
+            .accessibilityLabel("Search all captured requests and responses")
             Button(action: model.toggleNoCaching) {
                 Label(
                     "No Caching",
-                    systemImage: model.isNoCachingEnabled ? "externaldrive.badge.xmark.fill" : "externaldrive.badge.xmark"
+                    systemImage: model.isNoCachingEnabled ? "externaldrive.fill.badge.xmark" : "externaldrive.badge.xmark"
                 )
             }
             .help(model.isNoCachingEnabled ? "Allow conditional cache requests" : "Remove conditional cache headers from requests")

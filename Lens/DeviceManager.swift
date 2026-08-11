@@ -65,52 +65,110 @@ final class DeviceManager {
     private(set) var devices: [DeviceTarget] = []
     private(set) var isRefreshing = false
     private(set) var activeVPNPackage: String?
-    var adbPath: String?
+    var adbPath: String? { runtimePaths.bundledADBURL()?.path }
+    var onDevicesChanged: (([DeviceTarget]) -> Void)?
 
     private let runner = CommandRunner()
     private let preferences: DeviceAttachmentPreferences
     private let defaults: UserDefaults
+    private let runtimePaths: LensRuntimePaths
     private var attachedSnapshots: [String: ProxySnapshot] = [:]
+    private var deviceAliases: [String: String] = [:]
     private var overlaySerials = Set<String>()
+    private var trackerProcess: Process?
+    private var trackerOutput: Pipe?
+    private var trackerID: UUID?
+    private var trackerRestartTask: Task<Void, Never>?
+    private var monitoringEnabled = false
+    private var refreshPending = false
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, runtimePaths: LensRuntimePaths = .live()) {
         self.defaults = defaults
+        self.runtimePaths = runtimePaths
         preferences = DeviceAttachmentPreferences(defaults: defaults)
-        adbPath = locateADB()?.path
         loadSnapshots()
+        migrateAttachmentSnapshotsToRememberedDevices()
+        loadDeviceAliases()
     }
 
-    var lastAttachedEmulatorSerial: String? {
-        preferences.lastEmulatorSerial
+    var rememberedDetachedDevices: [DeviceTarget] {
+        devices.filter { target in
+            !target.isAttached && preferences.isRemembered(
+                deviceID: target.aliasKey,
+                transportID: target.serial
+            )
+        }
     }
 
     var preferredDetachedDevice: DeviceTarget? {
-        if let serial = preferences.lastEmulatorSerial,
-           let remembered = devices.first(where: { $0.serial == serial && !$0.isAttached }) {
+        if let remembered = rememberedDetachedDevices.first {
             return remembered
         }
         return devices.first { $0.kind == .emulator && !$0.isAttached }
     }
 
     func refresh() async {
-        guard !isRefreshing else { return }
+        if isRefreshing {
+            refreshPending = true
+            return
+        }
         isRefreshing = true
-        defer { isRefreshing = false }
+        repeat {
+            refreshPending = false
+            await performRefresh()
+        } while refreshPending
+        isRefreshing = false
+    }
+
+    func startMonitoring() {
+        guard !monitoringEnabled else { return }
+        monitoringEnabled = true
+        launchTracker()
+        Task { await refresh() }
+    }
+
+    func rename(_ target: DeviceTarget, to proposedName: String) {
+        let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            resetName(for: target)
+            return
+        }
+        deviceAliases[target.aliasKey] = name
+        persistDeviceAliases()
+        updateDevice(target.serial) { $0.customName = name }
+    }
+
+    func resetName(for target: DeviceTarget) {
+        deviceAliases.removeValue(forKey: target.aliasKey)
+        persistDeviceAliases()
+        updateDevice(target.serial) { $0.customName = nil }
+    }
+
+    func stopMonitoring() {
+        monitoringEnabled = false
+        trackerRestartTask?.cancel()
+        trackerRestartTask = nil
+        trackerOutput?.fileHandleForReading.readabilityHandler = nil
+        trackerProcess?.terminationHandler = nil
+        if trackerProcess?.isRunning == true {
+            trackerProcess?.terminate()
+        }
+        trackerProcess = nil
+        trackerOutput = nil
+        trackerID = nil
+    }
+
+    private func performRefresh() async {
         do {
-            let result = try await adb(["devices", "-l"])
-            let serials = result.output
-                .split(separator: "\n")
-                .dropFirst()
-                .compactMap { line -> String? in
-                    let fields = line.split(separator: " ")
-                    guard fields.count > 1, fields[1] == "device" else { return nil }
-                    return String(fields[0])
-                }
-            var discovered: [DeviceTarget] = []
+            let serials = try await discoverConnectedSerials()
+            var candidates: [(hardwareID: String, device: DeviceTarget)] = []
             for serial in serials {
-                let model = try await shell(serial, ["getprop", "ro.product.model"]).output.trimmingCharacters(in: .whitespacesAndNewlines)
-                let apiText = try await shell(serial, ["getprop", "ro.build.version.sdk"]).output.trimmingCharacters(in: .whitespacesAndNewlines)
-                let rootOutput = try await shell(serial, ["id", "-u"]).output.trimmingCharacters(in: .whitespacesAndNewlines)
+                // A connected device should remain visible even when one optional
+                // metadata probe is unavailable or the wireless link is briefly slow.
+                let model = await optionalShellOutput(serial, ["getprop", "ro.product.model"])
+                let apiText = await optionalShellOutput(serial, ["getprop", "ro.build.version.sdk"])
+                let rootOutput = await optionalShellOutput(serial, ["id", "-u"])
+                let hardwareSerial = await optionalShellOutput(serial, ["getprop", "ro.serialno"])
                 let addressOutput = (try? await shell(serial, ["ip", "-o", "-4", "addr", "show", "scope", "global"]).output) ?? ""
                 let networkAddresses = addressOutput
                     .split(whereSeparator: \.isWhitespace)
@@ -120,25 +178,106 @@ final class DeviceManager {
                         return String(address)
                     }
                 let kind: DeviceKind = serial.hasPrefix("emulator-") ? .emulator : .physical
-                discovered.append(
-                    DeviceTarget(
+                let stableHardwareID = hardwareSerial.isEmpty || hardwareSerial == "unknown" ? nil : hardwareSerial
+                let snapshotKey = stableHardwareID ?? serial
+                let storedSnapshot = attachedSnapshots[snapshotKey] ?? attachedSnapshots[serial]
+                let device = DeviceTarget(
                         serial: serial,
                         model: model.isEmpty ? serial : model,
                         apiLevel: Int(apiText) ?? 0,
                         kind: kind,
                         rootState: rootOutput == "0" ? .available : .unknown,
-                        isAttached: attachedSnapshots[serial] != nil,
-                        previousProxy: attachedSnapshots[serial],
+                        isAttached: storedSnapshot != nil,
+                        previousProxy: storedSnapshot,
                         caInstalled: false,
-                        networkAddresses: networkAddresses
+                        networkAddresses: networkAddresses,
+                        hardwareID: stableHardwareID
+                    )
+                candidates.append(
+                    (
+                        hardwareID: stableHardwareID ?? serial,
+                        device: device
                     )
                 )
             }
-            devices = discovered
+            replaceDevices(with: Self.deduplicatedDevices(candidates))
             await refreshVPNState()
+        } catch DeviceManagerError.adbNotFound {
+            replaceDevices(with: [])
         } catch {
-            devices = []
+            // A tracker event will retry after transient ADB/server failures.
+            // Preserve the last snapshot instead of flashing an empty sidebar.
         }
+    }
+
+    static func parseConnectedDeviceSerials(_ output: String) -> [String] {
+        output.split(whereSeparator: \.isNewline).compactMap { rawLine in
+            let line = String(rawLine)
+            guard !line.hasPrefix("List of devices attached") else { return nil }
+
+            // ADB uses a tab between the serial and state. Wireless mDNS serials
+            // may themselves contain spaces, so splitting on whitespace loses them.
+            if let separator = line.firstIndex(of: "\t") {
+                let serial = line[..<separator].trimmingCharacters(in: .whitespaces)
+                let state = line[line.index(after: separator)...]
+                    .split(whereSeparator: \.isWhitespace)
+                    .first
+                return state == "device" && !serial.isEmpty ? serial : nil
+            }
+
+            // Keep a fallback for ADB variants that render the delimiter as spaces.
+            guard let stateRange = line.range(
+                of: #"\s+device(?:\s|$)"#,
+                options: .regularExpression
+            ) else { return nil }
+            let serial = line[..<stateRange.lowerBound].trimmingCharacters(in: .whitespaces)
+            return serial.isEmpty ? nil : serial
+        }
+    }
+
+    static func parseMDNSConnectEndpoints(_ output: String) -> [String] {
+        output.split(whereSeparator: \.isNewline).compactMap { rawLine in
+            let fields = rawLine.split(whereSeparator: \.isWhitespace)
+            guard fields.contains(where: { $0 == "_adb-tls-connect._tcp" }),
+                  let endpoint = fields.last,
+                  endpoint.contains(":") else { return nil }
+            return String(endpoint)
+        }
+    }
+
+    static func deduplicatedDevices(
+        _ candidates: [(hardwareID: String, device: DeviceTarget)]
+    ) -> [DeviceTarget] {
+        var hardwareIDs: [String] = []
+        var devicesByHardwareID: [String: DeviceTarget] = [:]
+        for candidate in candidates {
+            guard let existing = devicesByHardwareID[candidate.hardwareID] else {
+                hardwareIDs.append(candidate.hardwareID)
+                devicesByHardwareID[candidate.hardwareID] = candidate.device
+                continue
+            }
+            if shouldPrefer(candidate.device, over: existing) {
+                devicesByHardwareID[candidate.hardwareID] = candidate.device
+            }
+        }
+        return hardwareIDs.compactMap { devicesByHardwareID[$0] }
+    }
+
+    private static func shouldPrefer(_ candidate: DeviceTarget, over existing: DeviceTarget) -> Bool {
+        if candidate.isAttached != existing.isAttached {
+            return candidate.isAttached
+        }
+        return transportRank(candidate.serial) < transportRank(existing.serial)
+    }
+
+    private static func transportRank(_ serial: String) -> Int {
+        if serial.hasPrefix("emulator-") { return 0 }
+        if !serial.contains("._adb-tls-connect._tcp") && !serial.contains(":") { return 0 }
+        if serial.range(of: #" \(\d+\)\._adb-tls-connect\._tcp$"#, options: .regularExpression) != nil {
+            return 3
+        }
+        if serial.contains("._adb-tls-connect._tcp") { return 1 }
+        return 2
     }
 
     func attach(_ target: DeviceTarget, proxyPort: Int, stopConflictingVPN: Bool = false) async throws {
@@ -148,7 +287,10 @@ final class DeviceManager {
         }
 
         let snapshot = try await readProxy(target.serial)
-        attachedSnapshots[target.serial] = snapshot
+        attachedSnapshots[target.aliasKey] = snapshot
+        if target.aliasKey != target.serial {
+            attachedSnapshots.removeValue(forKey: target.serial)
+        }
         persistSnapshots()
 
         var rootAvailable = target.rootState == .available
@@ -161,6 +303,7 @@ final class DeviceManager {
         }
 
         if rootAvailable {
+            try await waitForCertificate()
             try await installCA(on: target)
         }
 
@@ -179,13 +322,17 @@ final class DeviceManager {
             $0.rootState = rootAvailable ? .available : .unavailable
             $0.caInstalled = rootAvailable
         }
+        preferences.remember(deviceID: target.aliasKey)
         if target.kind == .emulator {
             preferences.remember(emulatorSerial: target.serial)
         }
     }
 
     func detach(_ target: DeviceTarget, forgetRememberedDevice: Bool = true) async throws {
-        let snapshot = attachedSnapshots[target.serial] ?? target.previousProxy
+        if forgetRememberedDevice {
+            preferences.forget(deviceID: target.aliasKey, transportID: target.serial)
+        }
+        let snapshot = attachedSnapshots[target.aliasKey] ?? attachedSnapshots[target.serial] ?? target.previousProxy
         if let host = snapshot?.host, let port = snapshot?.port {
             _ = try await shell(target.serial, ["settings", "put", "global", "http_proxy", "\(host):\(port)"])
             _ = try await shell(target.serial, ["settings", "put", "global", "global_http_proxy_host", host])
@@ -196,6 +343,7 @@ final class DeviceManager {
             _ = try await shell(target.serial, ["settings", "delete", "global", "global_http_proxy_port"])
         }
         try? await removeCA(from: target)
+        attachedSnapshots.removeValue(forKey: target.aliasKey)
         attachedSnapshots.removeValue(forKey: target.serial)
         persistSnapshots()
         updateDevice(target.serial) {
@@ -203,20 +351,6 @@ final class DeviceManager {
             $0.previousProxy = nil
             $0.caInstalled = false
         }
-        if forgetRememberedDevice, target.kind == .emulator {
-            preferences.forget(emulatorSerial: target.serial)
-        }
-    }
-
-    @discardableResult
-    func autoAttachLastEmulator(proxyPort: Int) async throws -> Bool {
-        guard let serial = preferences.lastEmulatorSerial,
-              let target = devices.first(where: { $0.serial == serial && $0.kind == .emulator }) else {
-            return false
-        }
-        guard !target.isAttached else { return true }
-        try await attach(target, proxyPort: proxyPort)
-        return true
     }
 
     func restoreAttachedDevices() {
@@ -235,16 +369,9 @@ final class DeviceManager {
         await restoreAttachedDevicesAndWait()
     }
 
-    func useADB(at path: String?) {
-        adbPath = path
-        defaults.set(path, forKey: "adbPath")
-    }
-
-#if DEBUG
     func prepareUITestDevices(_ fixtures: [DeviceTarget]) {
-        devices = fixtures
+        replaceDevices(with: fixtures)
     }
-#endif
 
     private func readProxy(_ serial: String) async throws -> ProxySnapshot {
         let output = try await shell(serial, ["settings", "get", "global", "http_proxy"])
@@ -258,8 +385,7 @@ final class DeviceManager {
     }
 
     private func installCA(on target: DeviceTarget) async throws {
-        let certificate = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".mitmproxy/mitmproxy-ca-cert.cer")
+        let certificate = runtimePaths.certificateURL
         guard FileManager.default.fileExists(atPath: certificate.path) else {
             throw DeviceManagerError.certificateMissing
         }
@@ -324,8 +450,7 @@ final class DeviceManager {
     }
 
     private func removeCA(from target: DeviceTarget) async throws {
-        let certificate = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".mitmproxy/mitmproxy-ca-cert.cer")
+        let certificate = runtimePaths.certificateURL
         guard FileManager.default.fileExists(atPath: certificate.path) else { return }
         let hash = try await runner.run(
             URL(fileURLWithPath: "/usr/bin/openssl"),
@@ -390,30 +515,106 @@ final class DeviceManager {
         try await adb(["-s", serial, "shell"] + arguments, timeout: timeout)
     }
 
+    private func optionalShellOutput(_ serial: String, _ arguments: [String]) async -> String {
+        guard let result = try? await shell(serial, arguments, timeout: 3) else { return "" }
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func launchTracker() {
+        guard monitoringEnabled, trackerProcess == nil,
+              let adbURL = runtimePaths.bundledADBURL() else { return }
+
+        let process = Process()
+        let output = Pipe()
+        let identifier = UUID()
+        process.executableURL = adbURL
+        process.arguments = ["track-devices", "-l"]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard !handle.availableData.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                await self?.refresh()
+            }
+        }
+        process.terminationHandler = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.trackerDidTerminate(identifier: identifier)
+            }
+        }
+
+        trackerProcess = process
+        trackerOutput = output
+        trackerID = identifier
+        do {
+            try process.run()
+        } catch {
+            trackerProcess = nil
+            trackerOutput = nil
+            trackerID = nil
+            scheduleTrackerRestart()
+        }
+    }
+
+    private func trackerDidTerminate(identifier: UUID) {
+        guard trackerID == identifier else { return }
+        trackerOutput?.fileHandleForReading.readabilityHandler = nil
+        trackerProcess = nil
+        trackerOutput = nil
+        trackerID = nil
+        scheduleTrackerRestart()
+    }
+
+    private func scheduleTrackerRestart() {
+        guard monitoringEnabled else { return }
+        trackerRestartTask?.cancel()
+        trackerRestartTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            self?.launchTracker()
+        }
+    }
+
+    private func discoverConnectedSerials() async throws -> [String] {
+        var result = try await adb(["devices", "-l"], timeout: 5)
+        var serials = Self.parseConnectedDeviceSerials(result.output)
+        guard serials.isEmpty,
+              let services = try? await adb(["mdns", "services"], timeout: 5) else {
+            return serials
+        }
+
+        let endpoints = Self.parseMDNSConnectEndpoints(services.output)
+        guard !endpoints.isEmpty else { return serials }
+        for endpoint in endpoints {
+            _ = try? await adb(["connect", endpoint], timeout: 5)
+        }
+        result = try await adb(["devices", "-l"], timeout: 5)
+        serials = Self.parseConnectedDeviceSerials(result.output)
+        return serials
+    }
+
     private func shellCommand(_ serial: String, _ command: String) async throws -> CommandResult {
         try await adb(["-s", serial, "shell", command])
     }
 
     private func adb(_ arguments: [String], timeout: TimeInterval? = nil) async throws -> CommandResult {
-        guard let adbPath else { throw DeviceManagerError.adbNotFound }
-        let result = try await runner.run(URL(fileURLWithPath: adbPath), arguments: arguments, timeout: timeout)
+        guard let adbURL = runtimePaths.bundledADBURL() else { throw DeviceManagerError.adbNotFound }
+        let result = try await runner.run(adbURL, arguments: arguments, timeout: timeout)
         if result.status != 0 {
             throw DeviceManagerError.commandFailed(result.errorOutput.isEmpty ? result.output : result.errorOutput)
         }
         return result
     }
 
-    private func locateADB() -> URL? {
-        let environment = ProcessInfo.processInfo.environment
-        let candidates = [
-            defaults.string(forKey: "adbPath"),
-            environment["ANDROID_HOME"].map { "\($0)/platform-tools/adb" },
-            environment["ANDROID_SDK_ROOT"].map { "\($0)/platform-tools/adb" },
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Android/sdk/platform-tools/adb").path,
-            "/opt/homebrew/bin/adb",
-            "/usr/local/bin/adb"
-        ].compactMap { $0 }
-        return candidates.map(URL.init(fileURLWithPath:)).first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    private func waitForCertificate(timeout: Duration = .seconds(10)) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !FileManager.default.fileExists(atPath: runtimePaths.certificateURL.path) {
+            guard clock.now < deadline else { throw DeviceManagerError.certificateMissing }
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(100))
+        }
     }
 
     private func localIPAddress() throws -> String {
@@ -449,6 +650,20 @@ final class DeviceManager {
     private func updateDevice(_ serial: String, mutation: (inout DeviceTarget) -> Void) {
         guard let index = devices.firstIndex(where: { $0.serial == serial }) else { return }
         mutation(&devices[index])
+        onDevicesChanged?(devices)
+    }
+
+    private func replaceDevices(with discovered: [DeviceTarget]) {
+        let renamedDevices = discovered.map { device in
+            var renamedDevice = device
+            if let alias = deviceAliases[device.aliasKey] {
+                renamedDevice.customName = alias
+            }
+            return renamedDevice
+        }
+        guard devices != renamedDevices else { return }
+        devices = renamedDevices
+        onDevicesChanged?(devices)
     }
 
     private func loadSnapshots() {
@@ -457,8 +672,24 @@ final class DeviceManager {
         attachedSnapshots = snapshots
     }
 
+    private func migrateAttachmentSnapshotsToRememberedDevices() {
+        for deviceID in attachedSnapshots.keys {
+            preferences.remember(deviceID: deviceID)
+        }
+    }
+
     private func persistSnapshots() {
         defaults.set(try? JSONEncoder().encode(attachedSnapshots), forKey: "attachedProxySnapshots")
+    }
+
+    private func loadDeviceAliases() {
+        guard let data = defaults.data(forKey: "deviceAliases"),
+              let aliases = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+        deviceAliases = aliases
+    }
+
+    private func persistDeviceAliases() {
+        defaults.set(try? JSONEncoder().encode(deviceAliases), forKey: "deviceAliases")
     }
 }
 
@@ -483,7 +714,7 @@ enum DeviceManagerError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .adbNotFound: "ADB was not found. Select it in Settings or install Android platform-tools."
+        case .adbNotFound: "The bundled ADB runtime is missing or cannot be executed. Reinstall Lens."
         case let .commandFailed(message): message.trimmingCharacters(in: .whitespacesAndNewlines)
         case .certificateMissing: "The mitmproxy CA is missing. Start mitmproxy once to generate it."
         case .certificateHashFailed: "Could not calculate the mitmproxy CA certificate hash."

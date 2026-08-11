@@ -1,7 +1,15 @@
 import SwiftUI
 
+enum InspectorPane: Hashable {
+    case request
+    case response
+}
+
 struct FlowInspectorView: View {
     let flow: FlowRecord?
+    @Binding var fullscreenPane: InspectorPane?
+    @Binding var requestSelectedTab: String
+    @Binding var responseSelectedTab: String
 
     var body: some View {
         if let flow {
@@ -29,19 +37,69 @@ struct FlowInspectorView: View {
                             .foregroundStyle(.orange)
                             .lineLimit(1)
                     }
+                    if let rewrittenRuleName = flow.rewrittenRuleName {
+                        Label(rewrittenRuleName, systemImage: "arrow.right.arrow.left")
+                            .foregroundStyle(.blue)
+                            .lineLimit(1)
+                    }
                 }
                 .padding(10)
                 Divider()
-                HSplitView {
-                    MessageInspector(title: "Request", headers: flow.requestHeaders, messageBody: flow.requestBody, raw: requestRaw(flow), query: queryText(flow), frames: [])
-                        .frame(minWidth: 240, maxWidth: .infinity)
-                    MessageInspector(title: "Response", headers: flow.responseHeaders, messageBody: flow.responseBody, raw: responseRaw(flow), query: "", frames: flow.websocketMessages)
-                        .frame(minWidth: 240, maxWidth: .infinity)
+                switch fullscreenPane {
+                case .request:
+                    requestInspector(flow)
+                case .response:
+                    responseInspector(flow)
+                case nil:
+                    HSplitView {
+                        requestInspector(flow)
+                        responseInspector(flow)
+                    }
                 }
             }
         } else {
             ContentUnavailableView("Select a request", systemImage: "network", description: Text("Request and response details will appear here."))
         }
+    }
+
+    private func requestInspector(_ flow: FlowRecord) -> some View {
+        MessageInspector(
+            flow: flow,
+            title: "Request",
+            headers: flow.requestHeaders,
+            messageBody: flow.requestBody,
+            raw: requestRaw(flow),
+            query: queryText(flow),
+            frames: [],
+            mappingBehavior: .rewriteRequest,
+            selectedTab: $requestSelectedTab,
+            isFullscreen: fullscreenPane == .request,
+            toggleFullscreen: { toggleFullscreen(.request) }
+        )
+        .id("\(flow.id)-request")
+        .frame(minWidth: 240, maxWidth: .infinity)
+    }
+
+    private func responseInspector(_ flow: FlowRecord) -> some View {
+        MessageInspector(
+            flow: flow,
+            title: "Response",
+            headers: flow.responseHeaders,
+            messageBody: flow.responseBody,
+            raw: responseRaw(flow),
+            query: "",
+            frames: flow.websocketMessages,
+            mappingBehavior: .localResponse,
+            selectedTab: $responseSelectedTab,
+            isFullscreen: fullscreenPane == .response,
+            toggleFullscreen: { toggleFullscreen(.response) }
+        )
+        .id("\(flow.id)-response")
+        .frame(minWidth: 240, maxWidth: .infinity)
+    }
+
+    private func toggleFullscreen(_ pane: InspectorPane) {
+        fullscreenPane = fullscreenPane == pane ? nil : pane
     }
 
     private func requestRaw(_ flow: FlowRecord) -> String {
@@ -60,22 +118,43 @@ struct FlowInspectorView: View {
 }
 
 private struct MessageInspector: View {
+    @Environment(LensModel.self) private var model
+
+    let flow: FlowRecord
     let title: String
     let headers: [HeaderField]
     let messageBody: BodyPayload?
     let raw: String
     let query: String
     let frames: [WebSocketFrame]
-    @State private var selectedTab = "Body"
+    let mappingBehavior: MappingBehavior
+    @Binding var selectedTab: String
+    let isFullscreen: Bool
+    let toggleFullscreen: () -> Void
+    @State private var editedRuleID: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(title).font(.headline).padding(.horizontal, 10).padding(.top, 8)
+            HStack(spacing: 8) {
+                Text(title).font(.headline)
+                Spacer()
+                Button(action: toggleFullscreen) {
+                    Image(systemName: isFullscreen
+                          ? "arrow.down.right.and.arrow.up.left"
+                          : "arrow.up.left.and.arrow.down.right")
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isFullscreen ? "Restore \(title) inspector" : "Maximize \(title) inspector")
+                .help(isFullscreen ? "Restore \(title) inspector" : "Maximize \(title) inspector")
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
             Picker("", selection: $selectedTab) {
                 Text("Header").tag("Header")
                 if !query.isEmpty { Text("Query").tag("Query") }
                 Text("Body").tag("Body")
                 if messageBody?.isJSON == true { Text("JSON").tag("JSON") }
+                if messageBody?.isJSON == true { Text("Tree").tag("Tree") }
                 Text("Raw").tag("Raw")
                 if !frames.isEmpty { Text("WebSocket").tag("WebSocket") }
             }
@@ -83,16 +162,138 @@ private struct MessageInspector: View {
             .padding(8)
             Group {
                 switch selectedTab {
-                case "Header": CodeTextView(text: .constant(headers.map { "\($0.name): \($0.value)" }.joined(separator: "\n")), isEditable: false)
+                case "Header": headerContent
                 case "Query": CodeTextView(text: .constant(query), isEditable: false)
                 case "Raw": CodeTextView(text: .constant(raw), isEditable: false)
                 case "WebSocket": WebSocketFramesView(frames: frames)
-                case "JSON": bodyContent(formatted: true)
+                case "JSON": jsonContent
+                case "Tree": treeContent
                 default: bodyContent(formatted: false)
                 }
             }
         }
         .frame(minWidth: 0, maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var jsonContent: some View {
+        if messageBody?.truncated == true {
+            ContentUnavailableView(
+                "JSON viewer unavailable",
+                systemImage: "exclamationmark.triangle",
+                description: Text("This body was truncated or evicted.")
+            )
+        } else if let messageBody, messageBody.isJSON {
+            JSONSyntaxViewer(data: treeBodyData)
+        } else {
+            ContentUnavailableView(
+                "JSON viewer unavailable",
+                systemImage: "curlybraces",
+                description: Text("The selected body is not valid JSON.")
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var treeContent: some View {
+        if messageBody?.truncated == true {
+            ContentUnavailableView(
+                "JSON tree unavailable",
+                systemImage: "exclamationmark.triangle",
+                description: Text("This body was truncated or evicted.")
+            )
+        } else if let messageBody, messageBody.isJSON {
+            VStack(spacing: 0) {
+                if let ruleID = activeRuleID {
+                    HStack(spacing: 6) {
+                        Label(
+                            mappingBehavior == .rewriteRequest ? "Request rewrite active" : "Local response active",
+                            systemImage: mappingBehavior.systemImage
+                        )
+                            .foregroundStyle(mappingBehavior == .rewriteRequest ? .blue : .orange)
+                        Spacer()
+                        Button(mappingBehavior == .rewriteRequest ? "Open Rewrite" : "Open Mock") {
+                            model.mappings.selectedRuleID = ruleID
+                            model.showingMappings = true
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Open this rule in Local Mappings")
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background((mappingBehavior == .rewriteRequest ? Color.blue : Color.orange).opacity(0.08))
+                }
+
+                JSONTreeEditorView(
+                    data: treeBodyData,
+                    isEditable: true,
+                    editingDescription: mappingBehavior == .rewriteRequest
+                        ? "Edit any value to create or update a Request Rewrite. Future matches are modified before reaching the server."
+                        : "Edit any value to create or update this response's Local Mapping."
+                ) { json in
+                    switch mappingBehavior {
+                    case .rewriteRequest:
+                        editedRuleID = model.updateRequestRewrite(for: flow, json: json)
+                    case .localResponse:
+                        editedRuleID = model.updateMockResponse(for: flow, json: json)
+                    }
+                }
+            }
+        } else {
+            ContentUnavailableView(
+                "JSON tree unavailable",
+                systemImage: "curlybraces",
+                description: Text("The selected body is not valid JSON.")
+            )
+        }
+    }
+
+    private var activeRuleID: UUID? {
+        if let editedRuleID { return editedRuleID }
+        let capturedRuleID = mappingBehavior == .rewriteRequest ? flow.rewrittenRuleID : flow.mappedRuleID
+        return capturedRuleID ?? model.mappings.rules.first(where: {
+            $0.sourceFlowID == flow.id && $0.behavior == mappingBehavior
+        })?.id
+    }
+
+    private var treeBodyData: Data {
+        guard let activeRuleID,
+              let rule = model.mappings.rules.first(where: { $0.id == activeRuleID }) else {
+            return messageBody?.data ?? Data()
+        }
+        return mappingBehavior == .rewriteRequest ? rule.requestBody.data : rule.responseBody.data
+    }
+
+    @ViewBuilder
+    private var headerContent: some View {
+        VStack(spacing: 0) {
+            if mappingBehavior == .rewriteRequest {
+                HStack(spacing: 6) {
+                    Label(
+                        activeRuleID == nil ? "Request headers are captured as sent." : "A Request Rewrite exists for this request.",
+                        systemImage: activeRuleID == nil ? "info.circle" : MappingBehavior.rewriteRequest.systemImage
+                    )
+                    Spacer()
+                    Button(activeRuleID == nil ? "Rewrite Headers…" : "Open Rewrite…") {
+                        let ruleID = activeRuleID ?? model.createRequestHeaderRewrite(for: flow)
+                        model.mappings.selectedRuleID = ruleID
+                        model.showingMappings = true
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Edit the headers sent to the upstream server")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.quaternary.opacity(0.35))
+            }
+            CodeTextView(
+                text: .constant(headers.map { "\($0.name): \($0.value)" }.joined(separator: "\n")),
+                isEditable: false
+            )
+        }
     }
 
     @ViewBuilder

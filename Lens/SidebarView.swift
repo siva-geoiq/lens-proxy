@@ -4,6 +4,7 @@ struct SidebarView: View {
     @Environment(LensModel.self) private var model
     @State private var expandedDeviceIDs = Set<String>()
     @State private var hostSearchText = ""
+    @State private var renamingDevice: DeviceTarget?
 
     var body: some View {
         @Bindable var captures = model.captures
@@ -66,6 +67,10 @@ struct SidebarView: View {
                 captures.selectedScope = .device(device.serial)
             }
         }
+        .sheet(item: $renamingDevice) { device in
+            DeviceRenameView(device: device)
+                .frame(width: 430)
+        }
     }
 
     @ViewBuilder
@@ -90,17 +95,19 @@ struct SidebarView: View {
                     .foregroundStyle(deviceFlows.isEmpty ? Color.secondary : Color.blue)
                     .frame(width: 18)
                     .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(device.model).lineLimit(1)
-                    Text(device.serial)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                Text(device.displayName)
+                    .lineLimit(1)
                 Spacer()
-                if !deviceFlows.isEmpty {
-                    Text("\(deviceFlows.count)")
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
+                VStack(alignment: .trailing, spacing: 3) {
+                    if !deviceFlows.isEmpty {
+                        Text("\(deviceFlows.count)")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    DeviceConnectionIndicator(
+                        device: device,
+                        isSyncing: model.attachingDeviceID == device.serial
+                    )
                 }
             }
             .padding(.leading, 8)
@@ -108,13 +115,84 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(device.model), \(device.serial)")
+        .accessibilityLabel("\(device.displayName), \(device.model), \(device.serial)")
         .accessibilityValue("\(deviceFlows.count) requests, \(isExpanded ? "expanded" : "collapsed")")
         .help(isExpanded ? "Collapse device hosts" : "Expand device hosts")
+        .contextMenu {
+            Button {
+                renamingDevice = device
+            } label: {
+                Label("Rename Device…", systemImage: "pencil")
+            }
+
+            if device.customName != nil {
+                Button {
+                    model.devices.resetName(for: device)
+                } label: {
+                    Label("Reset Device Name", systemImage: "arrow.uturn.backward")
+                }
+            }
+
+            Divider()
+
+            Button {
+                captures.selectedScope = .device(device.serial)
+            } label: {
+                Label("Show Device Traffic", systemImage: "network")
+            }
+
+            Button {
+                withAnimation(.snappy(duration: 0.18)) {
+                    if isExpanded { expandedDeviceIDs.remove(device.serial) }
+                    else { expandedDeviceIDs.insert(device.serial) }
+                }
+            } label: {
+                Label(
+                    isExpanded ? "Collapse Hosts" : "Expand Hosts",
+                    systemImage: isExpanded ? "chevron.up" : "chevron.down"
+                )
+            }
+
+            Divider()
+
+            if device.isAttached {
+                Button(role: .destructive) {
+                    model.detach(device)
+                } label: {
+                    Label("Detach from Lens", systemImage: "iphone.slash")
+                }
+            } else {
+                Button {
+                    model.attach(device)
+                } label: {
+                    Label("Attach to Lens", systemImage: "iphone.and.arrow.forward")
+                }
+                .disabled(model.attachingDeviceID != nil)
+            }
+
+            Button {
+                model.showingDevices = true
+            } label: {
+                Label("Manage Devices…", systemImage: "slider.horizontal.3")
+            }
+
+            Divider()
+
+            Button {
+                Task { await model.refreshDevices() }
+            } label: {
+                Label("Refresh Devices", systemImage: "arrow.clockwise")
+            }
+        }
 
         if isExpanded {
             HStack {
-                Label("All hosts", systemImage: "network")
+                Image(systemName: "network")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 17, height: 17)
+                    .accessibilityHidden(true)
+                Text("All hosts")
                 Spacer()
                 Text("\(deviceFlows.count)").foregroundStyle(.secondary)
             }
@@ -130,8 +208,7 @@ struct SidebarView: View {
 
     private func hostRow(_ host: (name: String, count: Int)) -> some View {
         HStack {
-            Image(systemName: "circle.hexagongrid")
-                .foregroundStyle(.secondary)
+            DomainHostIcon()
             Text(host.name).lineLimit(1)
             Spacer()
             Text("\(host.count)")
@@ -143,5 +220,70 @@ struct SidebarView: View {
         let query = hostSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return hosts }
         return hosts.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+}
+
+private struct DomainHostIcon: View {
+    var body: some View {
+        Image(systemName: "bolt.circle")
+            .font(.system(size: 16, weight: .medium))
+        .foregroundStyle(.secondary)
+        .frame(width: 17, height: 17)
+        .accessibilityHidden(true)
+    }
+}
+
+struct DeviceConnectionIndicator: View {
+    let device: DeviceTarget
+    var isSyncing = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if isSyncing {
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 9, height: 9)
+            } else {
+                Circle()
+                    .fill(indicatorColor)
+                    .frame(width: 7, height: 7)
+            }
+            Text(statusText)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(isSyncing || device.isAttached ? indicatorColor : .secondary)
+        }
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(device.displayName) connection status")
+        .accessibilityValue(accessibilityStatus)
+        .help(helpText)
+    }
+
+    private var indicatorColor: Color {
+        if isSyncing { return .orange }
+        return device.isAttached ? .green : .blue
+    }
+
+    private var statusText: String {
+        if isSyncing { return "Syncing…" }
+        return device.isAttached ? "Synced" : "Connected"
+    }
+
+    private var accessibilityStatus: String {
+        if isSyncing {
+            return "Connected through ADB and currently syncing with the Lens proxy"
+        }
+        return device.isAttached
+            ? "Connected through ADB and synced with the Lens proxy"
+            : "Connected through ADB, but not synced with the Lens proxy"
+    }
+
+    private var helpText: String {
+        if isSyncing {
+            return "Syncing: Lens is configuring this device's proxy and certificate"
+        }
+        return device.isAttached
+            ? "Synced: traffic from this device is routed through Lens"
+            : "Connected through ADB, but traffic is not routed through Lens. Open Devices and choose Attach."
     }
 }

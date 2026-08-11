@@ -8,6 +8,8 @@ final class CaptureStore {
     var selectedFlowID: String?
     var selectedScope: CaptureScope? = .allTraffic
     var searchText = ""
+    private(set) var isGlobalSearchPresented = false
+    private(set) var globalSearchFocusRequest = 0
     var selectedKind: FlowKind = .all
     var isCapturePaused = false
     private var indexByID: [String: Int] = [:]
@@ -35,16 +37,17 @@ final class CaptureStore {
     }
 
     var filteredFlows: [FlowRecord] {
-        flows.filter { flow in
+        let needle = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isGlobalSearchPresented, !needle.isEmpty {
+            return flows.filter { $0.matchesGlobalSearch(needle) }
+        }
+        return flows.filter { flow in
             let matchesScope = switch selectedScope ?? .allTraffic {
             case .allTraffic: true
             case .local: flow.deviceID == nil
             case let .device(deviceID): flow.deviceID == deviceID
             case let .host(deviceID, host): flow.deviceID == deviceID && flow.host == host
             }
-            let needle = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-            let matchesSearch = needle.isEmpty || flow.url.localizedCaseInsensitiveContains(needle) ||
-                flow.method.localizedCaseInsensitiveContains(needle) || flow.statusText.contains(needle)
             let matchesKind = switch selectedKind {
             case .all: true
             case .http: flow.scheme == "http"
@@ -59,8 +62,22 @@ final class CaptureStore {
                     flow.responseBody?.mimeType?.hasPrefix("audio/") == true
             case .other: isOther(flow)
             }
-            return matchesScope && matchesSearch && matchesKind
+            return matchesScope && matchesKind
         }
+    }
+
+    var isGlobalSearchActive: Bool {
+        isGlobalSearchPresented && !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func presentGlobalSearch() {
+        isGlobalSearchPresented = true
+        globalSearchFocusRequest &+= 1
+    }
+
+    func dismissGlobalSearch() {
+        searchText = ""
+        isGlobalSearchPresented = false
     }
 
     private func isOther(_ flow: FlowRecord) -> Bool {
@@ -97,7 +114,7 @@ final class CaptureStore {
                 (isLoopback(flow.clientAddress) && device.kind == .emulator && emulators.count == 1)
         }
         result.deviceID = matchedDevice?.serial
-        result.deviceName = matchedDevice?.model
+        result.deviceName = matchedDevice?.displayName
         return result
     }
 

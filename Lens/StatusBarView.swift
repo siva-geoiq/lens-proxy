@@ -7,6 +7,10 @@ struct StatusBarView: View {
         HStack(spacing: 14) {
             Text("\(model.captures.filteredFlows.count)/\(model.captures.flows.count) flows")
             Text(ByteCountFormatter.string(fromByteCount: Int64(model.captures.flows.reduce(0) { $0 + $1.size }), countStyle: .file))
+            if model.captures.isGlobalSearchActive {
+                Label("Global Search", systemImage: "magnifyingglass")
+                    .foregroundStyle(.primary)
+            }
             Spacer()
             statusChip("Map Local", active: !model.mappings.rules.isEmpty)
             statusChip("No Caching", active: model.isNoCachingEnabled)
