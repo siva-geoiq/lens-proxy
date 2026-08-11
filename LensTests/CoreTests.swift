@@ -370,6 +370,140 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(String(data: lines[1], encoding: .utf8), "{\"b\":2}")
     }
 
+    func testAgentFramerHandlesFragmentedAndMultipleMessages() throws {
+        let first = Data(#"{"type":"trace"}"#.utf8)
+        let second = Data(#"{"type":"status"}"#.utf8)
+        let bytes = framed(first) + framed(second)
+        var framer = LengthPrefixedJSONFramer()
+
+        XCTAssertTrue(try framer.append(Data(bytes.prefix(3))).isEmpty)
+        XCTAssertTrue(try framer.append(Data(bytes[3..<8])).isEmpty)
+        let frames = try framer.append(Data(bytes.dropFirst(8)))
+
+        XCTAssertEqual(frames, [first, second])
+    }
+
+    func testAgentFramerRejectsOversizedFramesBeforeAllocatingPayload() {
+        var framer = LengthPrefixedJSONFramer()
+        let oversizedLength = 4 * 1024 * 1024 + 1
+        let header = Data([
+            UInt8((oversizedLength >> 24) & 0xff),
+            UInt8((oversizedLength >> 16) & 0xff),
+            UInt8((oversizedLength >> 8) & 0xff),
+            UInt8(oversizedLength & 0xff)
+        ])
+
+        XCTAssertThrowsError(try framer.append(header))
+    }
+
+    func testAndroidInspectionParsesProcessesAndForegroundActivity() {
+        let processes = AndroidInspectionParser.processes("""
+          PID NAME
+         4205 com.lenskart.app
+         4210 com.lenskart.app:push
+        """)
+        let event = AndroidInspectionParser.activityEvent(
+            "08-11 13:00:00.000  1000  1000 I wm_set_resumed_activity: [0,com.lenskart.app/.home.ui.HomeBottomNavActivity,resumeTopActivity]",
+            observedAt: 100
+        )
+        let seeded = AndroidInspectionParser.foregroundActivity(
+            "mCurrentFocus=Window{abc u0 com.lenskart.app/com.lenskart.app.home.ui.HomeBottomNavActivity}",
+            observedAt: 101
+        )
+
+        XCTAssertEqual(processes[4205], "com.lenskart.app")
+        XCTAssertEqual(processes[4210], "com.lenskart.app:push")
+        XCTAssertEqual(event?.packageName, "com.lenskart.app")
+        XCTAssertEqual(event?.activityName, "com.lenskart.app.home.ui.HomeBottomNavActivity")
+        XCTAssertEqual(seeded?.activityName, "com.lenskart.app.home.ui.HomeBottomNavActivity")
+    }
+
+    func testAndroidTraceCorrelationUsesSafeRequestIDToResolveConcurrentIdenticalRequests() {
+        let correlator = AndroidTraceCorrelator(maximumAge: 5)
+        let url = "https://api.example.com/v1/items?page=1"
+        correlator.ingest(
+            makeTrace(sequence: 1, url: url, requestID: "request-one"),
+            deviceID: "device-1",
+            packageName: "com.lenskart.app",
+            activity: makeActivity(),
+            receivedAt: 100
+        )
+        correlator.ingest(
+            makeTrace(sequence: 2, url: url, requestID: "request-two"),
+            deviceID: "device-1",
+            packageName: "com.lenskart.app",
+            activity: makeActivity(),
+            receivedAt: 100.01
+        )
+        var flow = makeFlow(id: "matched", host: "api.example.com")
+        flow.url = url
+        flow.path = "/v1/items?page=1"
+        flow.startedAt = 100.02
+        flow.deviceID = "device-1"
+        flow.requestHeaders = [HeaderField(name: "X-Request-ID", value: "request-two")]
+
+        let context = correlator.context(for: flow, now: 100.02)
+
+        XCTAssertEqual(context?.status, .captured)
+        XCTAssertEqual(context?.confidence, .high)
+        XCTAssertEqual(context?.foregroundActivity, "com.lenskart.app.home.ui.HomeBottomNavActivity")
+        XCTAssertEqual(context?.primaryCallSite?.methodName, "loadBottomNavigation")
+    }
+
+    func testAndroidTraceCorrelationDoesNotGuessBetweenIdenticalRequests() {
+        let correlator = AndroidTraceCorrelator(maximumAge: 5)
+        let url = "https://api.example.com/v1/items"
+        correlator.ingest(
+            makeTrace(sequence: 1, url: url),
+            deviceID: "device-1",
+            packageName: "com.lenskart.app",
+            activity: makeActivity(),
+            receivedAt: 100
+        )
+        correlator.ingest(
+            makeTrace(sequence: 2, url: url),
+            deviceID: "device-1",
+            packageName: "com.lenskart.app",
+            activity: makeActivity(),
+            receivedAt: 100.01
+        )
+        var flow = makeFlow(id: "ambiguous", host: "api.example.com")
+        flow.url = url
+        flow.path = "/v1/items"
+        flow.startedAt = 100.02
+        flow.deviceID = "device-1"
+
+        let context = correlator.context(for: flow, now: 100.02)
+
+        XCTAssertEqual(context?.status, .ambiguous)
+        XCTAssertNil(context?.primaryCallSite)
+        XCTAssertTrue(context?.stackFrames.isEmpty == true)
+    }
+
+    func testAndroidContextSurvivesSessionEncodingAndParticipatesInGlobalSearch() throws {
+        var flow = makeFlow(id: "android-context", host: "api.example.com")
+        flow.androidContext = AndroidRequestContext(
+            status: .captured,
+            confidence: .high,
+            packageName: "com.lenskart.app",
+            processName: "com.lenskart.app",
+            pid: 4205,
+            threadName: "DefaultDispatcher-worker-1",
+            foregroundActivity: "com.lenskart.app.home.ui.HomeBottomNavActivity",
+            primaryCallSite: makeApplicationFrame(),
+            stackFrames: [makeApplicationFrame()],
+            capturedAt: 100,
+            correlationDelayMilliseconds: 12
+        )
+
+        let decoded = try JSONDecoder().decode(FlowRecord.self, from: JSONEncoder().encode(flow))
+
+        XCTAssertEqual(decoded.androidContext, flow.androidContext)
+        XCTAssertTrue(decoded.matchesGlobalSearch("HomeBottomNavActivity"))
+        XCTAssertTrue(decoded.matchesGlobalSearch("loadBottomNavigation"))
+        XCTAssertTrue(decoded.matchesGlobalSearch("HomeRepository.kt:142"))
+    }
+
     func testRememberedEmulatorSurvivesCleanupUntilManuallyForgotten() throws {
         let suiteName = "LensTests.DeviceAttachment.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -509,6 +643,60 @@ final class CoreTests: XCTestCase {
             previousProxy: nil,
             caInstalled: false,
             networkAddresses: ["10.211.32.130"]
+        )
+    }
+
+    private func framed(_ payload: Data) -> Data {
+        var data = Data([
+            UInt8((payload.count >> 24) & 0xff),
+            UInt8((payload.count >> 16) & 0xff),
+            UInt8((payload.count >> 8) & 0xff),
+            UInt8(payload.count & 0xff)
+        ])
+        data.append(payload)
+        return data
+    }
+
+    private func makeTrace(sequence: UInt64, url: String, requestID: String? = nil) -> AndroidAgentTrace {
+        AndroidAgentTrace(
+            sequence: sequence,
+            method: "GET",
+            url: url,
+            processName: "com.lenskart.app",
+            pid: 4205,
+            threadName: "DefaultDispatcher-worker-1",
+            capturedAt: 100,
+            correlationHeaders: requestID.map { ["x-request-id": $0] } ?? [:],
+            stackFrames: [
+                AndroidStackFrame(
+                    className: "okhttp3.RealCall",
+                    methodName: "execute",
+                    signature: "()Lokhttp3/Response;",
+                    sourceFile: "RealCall.kt",
+                    lineNumber: 153,
+                    isFramework: true
+                ),
+                makeApplicationFrame()
+            ]
+        )
+    }
+
+    private func makeActivity() -> AndroidActivitySnapshot {
+        AndroidActivitySnapshot(
+            packageName: "com.lenskart.app",
+            activityName: "com.lenskart.app.home.ui.HomeBottomNavActivity",
+            observedAt: 99
+        )
+    }
+
+    private func makeApplicationFrame() -> AndroidStackFrame {
+        AndroidStackFrame(
+            className: "com.lenskart.app.home.data.HomeRepository",
+            methodName: "loadBottomNavigation",
+            signature: "()V",
+            sourceFile: "HomeRepository.kt",
+            lineNumber: 142,
+            isFramework: false
         )
     }
 

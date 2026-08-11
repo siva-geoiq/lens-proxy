@@ -108,6 +108,9 @@ struct SidebarView: View {
                         device: device,
                         isSyncing: model.attachingDeviceID == device.serial
                     )
+                    if device.isAttached {
+                        DeepInspectionStatusView(device: device, compact: true)
+                    }
                 }
             }
             .padding(.leading, 8)
@@ -152,6 +155,11 @@ struct SidebarView: View {
                     systemImage: isExpanded ? "chevron.up" : "chevron.down"
                 )
             }
+
+            Divider()
+
+            DeepInspectionMenu(device: device)
+                .disabled(!device.isAttached)
 
             Divider()
 

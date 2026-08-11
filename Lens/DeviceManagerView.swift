@@ -48,6 +48,9 @@ struct DeviceManagerView: View {
                                     device: device,
                                     isSyncing: model.attachingDeviceID == device.serial
                                 )
+                                if device.isAttached {
+                                    DeepInspectionStatusView(device: device)
+                                }
                                 if let proxy = device.previousProxy {
                                     Text("Previous proxy: \(proxy.displayValue)")
                                         .font(.caption2)
@@ -69,6 +72,9 @@ struct DeviceManagerView: View {
                                         model.devices.resetName(for: device)
                                     }
                                 }
+                                Divider()
+                                DeepInspectionMenu(device: device)
+                                    .disabled(!device.isAttached)
                             } label: {
                                 Image(systemName: "ellipsis.circle")
                             }

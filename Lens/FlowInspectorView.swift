@@ -157,6 +157,7 @@ private struct MessageInspector: View {
                 if messageBody?.isJSON == true { Text("Tree").tag("Tree") }
                 Text("Raw").tag("Raw")
                 if !frames.isEmpty { Text("WebSocket").tag("WebSocket") }
+                if mappingBehavior == .rewriteRequest && flow.deviceID != nil { Text("Android").tag("Android") }
             }
             .pickerStyle(.segmented)
             .padding(8)
@@ -168,6 +169,7 @@ private struct MessageInspector: View {
                 case "WebSocket": WebSocketFramesView(frames: frames)
                 case "JSON": jsonContent
                 case "Tree": treeContent
+                case "Android": AndroidContextView(flow: flow)
                 default: bodyContent(formatted: false)
                 }
             }

@@ -9,7 +9,7 @@ from pathlib import Path
 from mitmproxy import ctx, http, io, version
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_BODY_BYTES = 10 * 1024 * 1024
 
 
@@ -126,6 +126,14 @@ class LensAddon:
                 await self.write(writer, "sessionReset", {}, request_id)
                 for flow in loaded:
                     await self.events.put(self.envelope("flowUpsert", self.serialize_flow(flow)))
+            elif message_type == "annotateFlow":
+                flow_id = payload.get("flowID")
+                flow = self.flows.get(flow_id)
+                if not flow:
+                    raise ValueError(f"Unknown flow: {flow_id}")
+                flow.metadata["lens_android_context"] = payload.get("androidContext")
+                self.emit_flow(flow)
+                await self.write(writer, "flowAnnotated", {"flowID": flow_id}, request_id)
             elif message_type == "shutdown":
                 await self.write(writer, "shuttingDown", {}, request_id)
                 ctx.master.shutdown()
@@ -271,6 +279,7 @@ class LensAddon:
             "rewrittenRuleName": flow.metadata.get("lens_rewrite_name"),
             "error": flow.error.msg if flow.error else None,
             "websocketMessages": websocket_messages,
+            "androidContext": flow.metadata.get("lens_android_context"),
         }
 
     def serialize_headers(self, headers):

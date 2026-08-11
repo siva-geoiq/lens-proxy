@@ -52,7 +52,7 @@ final class BridgeClient: @unchecked Sendable {
             guard let self, let connection = self.connection else { return }
             do {
                 let envelope = BridgeEnvelope(
-                    protocolVersion: 1,
+                    protocolVersion: 2,
                     requestID: requestID,
                     type: type,
                     payload: try JSONValue(payload),
@@ -63,7 +63,7 @@ final class BridgeClient: @unchecked Sendable {
                 connection.send(content: data, completion: .contentProcessed { _ in })
             } catch {
                 let errorEnvelope = BridgeEnvelope(
-                    protocolVersion: 1,
+                    protocolVersion: 2,
                     requestID: requestID,
                     type: "clientError",
                     payload: nil,
@@ -98,7 +98,7 @@ final class BridgeClient: @unchecked Sendable {
             } catch {
                 onEnvelope?(
                     BridgeEnvelope(
-                        protocolVersion: 1,
+                        protocolVersion: 2,
                         requestID: nil,
                         type: "clientError",
                         payload: nil,

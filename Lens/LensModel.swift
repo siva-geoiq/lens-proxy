@@ -11,6 +11,7 @@ final class LensModel {
     let captures: CaptureStore
     let mappings: MappingStore
     let devices: DeviceManager
+    let inspector: AndroidInspectorManager
 
     private let engine: EngineProcessManager
     private let bridge: BridgeClient
@@ -37,12 +38,14 @@ final class LensModel {
         captures: CaptureStore = CaptureStore(),
         mappings: MappingStore = MappingStore(),
         devices: DeviceManager = DeviceManager(),
+        inspector: AndroidInspectorManager = AndroidInspectorManager(),
         engine: EngineProcessManager = EngineProcessManager(),
         bridge: BridgeClient = BridgeClient()
     ) {
         self.captures = captures
         self.mappings = mappings
         self.devices = devices
+        self.inspector = inspector
         self.engine = engine
         self.bridge = bridge
         let storedPort = UserDefaults.standard.integer(forKey: "proxyPort")
@@ -60,8 +63,11 @@ final class LensModel {
         devices.onDevicesChanged = { [weak self] devices in
             guard let self else { return }
             self.captures.attributeFlows(to: devices)
+            self.inspector.updateDevices(devices)
             Task { await self.autoAttachRememberedDevices() }
         }
+        inspector.onError = { [weak self] message in self?.lastError = message }
+        inspector.onTrace = { [weak self] in self?.applyPendingAndroidContexts() }
     }
 
     func startEngine() {
@@ -207,6 +213,7 @@ final class LensModel {
 
     func clearFlows() {
         captures.clear()
+        inspector.clear()
         bridge.send(type: "clearFlows")
     }
 
@@ -297,6 +304,7 @@ final class LensModel {
         allowsAutomaticDeviceSync = false
         devicePreparationTask?.cancel()
         devices.stopMonitoring()
+        await inspector.stop()
         await devices.restoreAttachedDevicesAndWait()
         stopEngine()
     }
@@ -323,7 +331,7 @@ final class LensModel {
         do {
             switch envelope.type {
             case "hello":
-                guard envelope.protocolVersion == 1 else {
+                guard envelope.protocolVersion == 2 else {
                     engineState = .failed("Lens bridge protocol \(envelope.protocolVersion) is incompatible with this app.")
                     bridge.disconnect()
                     engine.stop()
@@ -344,14 +352,24 @@ final class LensModel {
                 Task { await autoAttachRememberedDevices() }
             case "flowUpsert":
                 guard let payload = envelope.payload else { return }
-                let flow = try payload.decode(FlowRecord.self)
+                var flow = captures.attributed(try payload.decode(FlowRecord.self), to: devices.devices)
+                if flow.androidContext == nil, let context = inspector.context(for: flow) {
+                    flow.androidContext = context
+                    bridge.send(
+                        type: "annotateFlow",
+                        payload: FlowAnnotationPayload(flowID: flow.id, androidContext: context)
+                    )
+                } else if let context = flow.androidContext {
+                    _ = inspector.context(for: flow)
+                    flow.androidContext = context
+                }
                 let pathWithoutQuery = String(flow.path.split(separator: "?", maxSplits: 1).first ?? "")
                 let mappingName = flow.mappedRuleName ?? "none"
                 let rewriteName = flow.rewrittenRuleName ?? "none"
                 logger.info(
                     "Captured \(flow.method, privacy: .public) \(flow.host, privacy: .public)\(pathWithoutQuery, privacy: .public) status \(flow.responseStatus ?? -1) mapping \(mappingName, privacy: .public) rewrite \(rewriteName, privacy: .public)"
                 )
-                captures.upsert(captures.attributed(flow, to: devices.devices))
+                captures.upsert(flow)
             case "sessionReset":
                 captures.clear()
             case "captureState":
@@ -372,6 +390,18 @@ final class LensModel {
             }
         } catch {
             lastError = "Could not decode \(envelope.type): \(error.localizedDescription)"
+        }
+    }
+
+    private func applyPendingAndroidContexts() {
+        for var flow in captures.flows where flow.androidContext == nil {
+            guard let context = inspector.context(for: flow) else { continue }
+            flow.androidContext = context
+            captures.upsert(flow)
+            bridge.send(
+                type: "annotateFlow",
+                payload: FlowAnnotationPayload(flowID: flow.id, androidContext: context)
+            )
         }
     }
 

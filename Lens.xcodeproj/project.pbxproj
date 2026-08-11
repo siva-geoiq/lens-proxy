@@ -104,6 +104,7 @@
 				47347D4F3029D60000424932 /* Resources */,
 				C10000013029D60000424932 /* Embed mitmproxy Runtime */,
 				C10000023029D60000424932 /* Embed Android Platform Tools */,
+				C10000033029D60000424932 /* Embed Android Inspector Agent */,
 			);
 			buildRules = (
 			);
@@ -280,6 +281,29 @@
 			shellScript = "\"$SRCROOT/Scripts/embed_android_platform_tools.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
+		C10000033029D60000424932 /* Embed Android Inspector Agent */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 0;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Scripts/embed_android_inspector_agent.sh",
+				"$(SRCROOT)/Vendor/lens-android-inspector-1.zip",
+			);
+			name = "Embed Android Inspector Agent";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/android-inspector",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "\"$SRCROOT/Scripts/embed_android_inspector_agent.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -442,7 +466,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ARCHS = arm64;
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = lens_icon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -473,7 +497,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ARCHS = arm64;
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = lens_icon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;

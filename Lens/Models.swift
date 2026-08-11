@@ -69,6 +69,54 @@ struct WebSocketFrame: Codable, Hashable, Identifiable, Sendable {
     var timestamp: Double
 }
 
+enum AndroidContextStatus: String, Codable, Hashable, Sendable {
+    case captured
+    case activityOnly
+    case ambiguous
+    case unmatched
+}
+
+enum AndroidMatchConfidence: String, Codable, Hashable, Sendable {
+    case high
+    case observational
+    case none
+}
+
+struct AndroidStackFrame: Codable, Hashable, Identifiable, Sendable {
+    var id: String { "\(className)#\(methodName)#\(sourceFile ?? "")#\(lineNumber ?? -1)" }
+    var className: String
+    var methodName: String
+    var signature: String
+    var sourceFile: String?
+    var lineNumber: Int?
+    var isFramework: Bool
+
+    var displayName: String {
+        let source = sourceFile.map { file in
+            lineNumber.map { "\(file):\($0)" } ?? file
+        }
+        return "\(className).\(methodName)\(source.map { " (\($0))" } ?? "")"
+    }
+}
+
+struct AndroidRequestContext: Codable, Hashable, Sendable {
+    var status: AndroidContextStatus
+    var confidence: AndroidMatchConfidence
+    var packageName: String
+    var processName: String
+    var pid: Int
+    var threadName: String
+    var foregroundActivity: String?
+    var primaryCallSite: AndroidStackFrame?
+    var stackFrames: [AndroidStackFrame]
+    var capturedAt: Double
+    var correlationDelayMilliseconds: Double?
+
+    var stackText: String {
+        stackFrames.map(\.displayName).joined(separator: "\n")
+    }
+}
+
 struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
     var id: String
     var clientAddress: String
@@ -96,6 +144,7 @@ struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
     var websocketMessages: [WebSocketFrame]
     var deviceID: String? = nil
     var deviceName: String? = nil
+    var androidContext: AndroidRequestContext? = nil
 
     var displayURL: String {
         url.removingPercentEncoding ?? url
@@ -152,6 +201,18 @@ struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
             responseBody?.mimeType
         ]
         metadata.append(contentsOf: optionalMetadata.compactMap { $0 })
+        if let context = androidContext {
+            metadata.append(contentsOf: [
+                context.packageName,
+                context.processName,
+                context.threadName,
+                context.foregroundActivity ?? "",
+                context.primaryCallSite?.displayName ?? "",
+                context.stackText,
+                context.status.rawValue,
+                context.confidence.rawValue
+            ])
+        }
 
         if metadata.contains(where: { $0.localizedCaseInsensitiveContains(query) }) {
             return true
@@ -450,6 +511,54 @@ struct DeviceTarget: Codable, Hashable, Identifiable, Sendable {
         let trimmedHardwareID = hardwareID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmedHardwareID.isEmpty || trimmedHardwareID == "unknown" ? serial : trimmedHardwareID
     }
+}
+
+struct DebuggableProcess: Codable, Hashable, Identifiable, Sendable {
+    var id: String { "\(deviceID):\(pid)" }
+    var deviceID: String
+    var packageName: String
+    var processName: String
+    var pid: Int
+    var abi: String
+}
+
+enum DeepInspectionSelection: Codable, Hashable, Sendable {
+    case automatic
+    case package(String)
+    case off
+}
+
+enum InspectionState: Equatable, Sendable {
+    case idle
+    case discovering
+    case attaching(String)
+    case active(String)
+    case unsupported(String)
+    case conflict(String)
+    case failed(String)
+
+    var label: String {
+        switch self {
+        case .idle: "Inspection idle"
+        case .discovering: "Finding debuggable app…"
+        case let .attaching(package): "Inspecting \(package)…"
+        case let .active(package): "Inspecting \(package)"
+        case let .unsupported(message), let .conflict(message), let .failed(message): message
+        }
+    }
+}
+
+struct AgentEnvelope: Codable, Sendable {
+    var protocolVersion: Int
+    var token: String?
+    var type: String
+    var payload: JSONValue?
+    var error: BridgeErrorPayload?
+}
+
+struct FlowAnnotationPayload: Codable, Sendable {
+    var flowID: String
+    var androidContext: AndroidRequestContext
 }
 
 struct BridgeEnvelope: Codable, Sendable {

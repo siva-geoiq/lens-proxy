@@ -3,6 +3,7 @@ import Foundation
 struct LensRuntimePaths: Sendable {
     static let bundledMitmdumpRelativePath = "Contents/Helpers/mitmproxy.app/Contents/MacOS/mitmdump"
     static let bundledADBRelativePath = "Contents/Helpers/platform-tools/adb"
+    static let bundledAndroidAgentDirectory = "Contents/Helpers/android-inspector"
 
     let applicationBundleURL: URL
     let applicationSupportDirectory: URL
@@ -36,6 +37,13 @@ struct LensRuntimePaths: Sendable {
 
     func bundledADBURL(fileManager: FileManager = .default) -> URL? {
         executableURL(relativePath: Self.bundledADBRelativePath, fileManager: fileManager)
+    }
+
+    func bundledAndroidAgentURL(abi: String, fileManager: FileManager = .default) -> URL? {
+        let normalizedABI = abi == "x86_64" ? "x86_64" : "arm64-v8a"
+        let relativePath = "\(Self.bundledAndroidAgentDirectory)/\(normalizedABI)/liblens_jvmti.so"
+        let url = applicationBundleURL.appendingPathComponent(relativePath)
+        return fileManager.fileExists(atPath: url.path) ? url : nil
     }
 
     private func executableURL(relativePath: String, fileManager: FileManager) -> URL? {
