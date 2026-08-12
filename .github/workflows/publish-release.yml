@@ -1,0 +1,112 @@
+name: Publish Lens release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing semantic-version tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lens-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-26
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED_TAG:-${GITHUB_REF_NAME}}"
+          if [[ ! "${tag}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "error: release tag must use vX.Y.Z" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          build_number="$((10#${BASH_REMATCH[1]} * 1000000 + 10#${BASH_REMATCH[2]} * 1000 + 10#${BASH_REMATCH[3]}))"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "build_number=${build_number}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Validate release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          xcodebuild -version
+          git fetch origin main --depth=1
+          tag_commit="$(git rev-list -n 1 '${{ steps.release.outputs.tag }}')"
+          git merge-base --is-ancestor "${tag_commit}" origin/main
+
+      - name: Prepare Sparkle signing key
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.LENS_SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${SPARKLE_PRIVATE_KEY}"
+          key_path="${RUNNER_TEMP}/lens-sparkle-private-key"
+          printf '%s' "${SPARKLE_PRIVATE_KEY}" > "${key_path}"
+          chmod 600 "${key_path}"
+          echo "LENS_SPARKLE_PRIVATE_KEY=${key_path}" >> "${GITHUB_ENV}"
+
+      - name: Build signed release artifacts
+        shell: bash
+        env:
+          LENS_RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          LENS_BUILD_NUMBER: ${{ steps.release.outputs.build_number }}
+          LENS_UPDATE_FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml
+          LENS_UPDATE_DOWNLOAD_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}
+          LENS_UPDATE_RELEASE_PAGE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.release.outputs.tag }}
+        run: ./Scripts/build_release.sh
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          dmg="dist/Lens-${RELEASE_VERSION}-macos-arm64.dmg"
+          checksum="${dmg}.sha256"
+          appcast="dist/update-feed/appcast.xml"
+          test -f "${dmg}"
+          test -f "${checksum}"
+          test -f "${appcast}"
+          test -f dist/INSTALL.md
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "Lens ${RELEASE_VERSION}" \
+            --notes "Apple-silicon Lens ${RELEASE_VERSION}. This build is ad-hoc signed and is not notarized by Apple. Verify the SHA-256 checksum and follow INSTALL.md before opening it." \
+            --latest \
+            "${dmg}" "${checksum}" dist/INSTALL.md "${appcast}"
+
+      - name: Retain checksums and install guide
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lens-${{ steps.release.outputs.version }}-release-metadata
+          path: |
+            dist/Lens-${{ steps.release.outputs.version }}-macos-arm64.dmg.sha256
+            dist/INSTALL.md
+            dist/update-feed/appcast.xml
+          if-no-files-found: error

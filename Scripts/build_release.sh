@@ -80,7 +80,7 @@ if [[ -n "${LENS_SPARKLE_PRIVATE_KEY:-}" ]]; then
         exit 1
     fi
     if [[ ! -f "${LENS_SPARKLE_PRIVATE_KEY}" ]]; then
-        echo "error: LENS_SPARKLE_PRIVATE_KEY must point to the GitLab CI file variable" >&2
+        echo "error: LENS_SPARKLE_PRIVATE_KEY must point to a readable Sparkle private-key file" >&2
         exit 1
     fi
 
