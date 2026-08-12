@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum InspectorPane: Hashable {
@@ -139,6 +140,16 @@ private struct MessageInspector: View {
             HStack(spacing: 8) {
                 Text(title).font(.headline)
                 Spacer()
+                if selectedTab == "JSON", let jsonPayload = copyableJSONPayload {
+                    Button {
+                        copyToPasteboard(jsonPayload)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Copy \(title) JSON payload")
+                    .help("Copy \(title.lowercased()) JSON payload")
+                }
                 Button(action: toggleFullscreen) {
                     Image(systemName: isFullscreen
                           ? "arrow.down.right.and.arrow.up.left"
@@ -266,6 +277,20 @@ private struct MessageInspector: View {
             return messageBody?.data ?? Data()
         }
         return mappingBehavior == .rewriteRequest ? rule.requestBody.data : rule.responseBody.data
+    }
+
+    private var copyableJSONPayload: String? {
+        guard messageBody?.truncated != true,
+              let document = try? JSONValue.decodeJSON(from: treeBodyData),
+              let data = try? document.encodedJSON() else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 
     @ViewBuilder
