@@ -32,7 +32,5 @@ release_dmg:
     when: always
     expire_in: 1 week
     paths:
-      - dist/Lens-*-macos-arm64.dmg
       - dist/Lens-*-macos-arm64.dmg.sha256
       - dist/INSTALL.md
-      - dist/update-feed/
