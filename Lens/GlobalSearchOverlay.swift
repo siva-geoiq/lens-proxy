@@ -1,6 +1,11 @@
 import SwiftUI
 
 struct GlobalSearchOverlay: View {
+    private struct MatchPreview {
+        let label: String
+        let value: String
+    }
+
     @Environment(LensModel.self) private var model
     @State private var highlightedFlowID: String?
     @FocusState private var isSearchFieldFocused: Bool
@@ -149,27 +154,38 @@ struct GlobalSearchOverlay: View {
             open(flow)
         } label: {
             HStack(spacing: 12) {
-                Text(flow.method)
+                highlightedText(flow.method)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.green)
                     .frame(width: 50, alignment: .leading)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(flow.displayURL)
+                    highlightedText(flow.displayURL)
                         .lineLimit(1)
                         .truncationMode(.tail)
                     HStack(spacing: 6) {
-                        Text(flow.clientDisplayName)
+                        highlightedText(flow.clientDisplayName)
                         Text("·")
-                        Text(flow.statusText)
+                        highlightedText(flow.statusText)
                         if let mimeType = flow.responseBody?.mimeType ?? flow.requestBody?.mimeType {
                             Text("·")
-                            Text(mimeType)
+                            highlightedText(mimeType)
                         }
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+
+                    if let preview = matchPreview(for: flow) {
+                        HStack(spacing: 5) {
+                            highlightedText(preview.label)
+                                .fontWeight(.semibold)
+                            highlightedText(contextualSnippet(preview.value))
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    }
                 }
 
                 Spacer(minLength: 8)
@@ -220,5 +236,155 @@ struct GlobalSearchOverlay: View {
     private func open(_ flow: FlowRecord) {
         model.captures.selectedFlowID = flow.id
         model.captures.dismissGlobalSearch()
+    }
+
+    private func highlightedText(_ value: String) -> Text {
+        guard !query.isEmpty else { return Text(value) }
+
+        var output = Text("")
+        var searchStart = value.startIndex
+        while searchStart < value.endIndex,
+              let match = value.range(
+                of: query,
+                options: [.caseInsensitive, .diacriticInsensitive],
+                range: searchStart..<value.endIndex
+              ) {
+            output = output + Text(String(value[searchStart..<match.lowerBound]))
+            output = output + Text(String(value[match]))
+                .bold()
+                .foregroundColor(.accentColor)
+            searchStart = match.upperBound
+        }
+        return output + Text(String(value[searchStart...]))
+    }
+
+    private func matchPreview(for flow: FlowRecord) -> MatchPreview? {
+        let visibleValues = [
+            flow.method,
+            flow.displayURL,
+            flow.clientDisplayName,
+            flow.statusText,
+            flow.responseBody?.mimeType ?? flow.requestBody?.mimeType ?? ""
+        ]
+        if visibleValues.contains(where: containsQuery) {
+            return nil
+        }
+
+        var candidates: [MatchPreview] = [
+            MatchPreview(label: "Flow ID", value: flow.id),
+            MatchPreview(label: "Client address", value: flow.clientAddress),
+            MatchPreview(label: "Scheme", value: flow.scheme),
+            MatchPreview(label: "Host", value: flow.host),
+            MatchPreview(label: "Port", value: String(flow.port)),
+            MatchPreview(label: "Path", value: flow.path),
+            MatchPreview(label: "Raw URL", value: flow.url),
+            MatchPreview(label: "Size", value: String(flow.size)),
+            MatchPreview(label: "Started", value: String(flow.startedAt)),
+            MatchPreview(label: "Request line", value: "\(flow.method) \(flow.path) HTTP"),
+            MatchPreview(label: "cURL", value: flow.curlCommand),
+            MatchPreview(label: "cURL", value: "curl -X \(flow.method)")
+        ]
+
+        if let deviceID = flow.deviceID {
+            candidates.append(MatchPreview(label: "Device ID", value: deviceID))
+        }
+        if let deviceName = flow.deviceName {
+            candidates.append(MatchPreview(label: "Device", value: deviceName))
+        }
+        if let endedAt = flow.endedAt {
+            candidates.append(MatchPreview(label: "Ended", value: String(endedAt)))
+        }
+        if let duration = flow.duration {
+            candidates.append(MatchPreview(label: "Duration", value: String(duration)))
+        }
+        if let mappedRuleID = flow.mappedRuleID {
+            candidates.append(MatchPreview(label: "Local Mapping ID", value: mappedRuleID.uuidString))
+        }
+
+        candidates.append(contentsOf: flow.requestHeaders.map {
+            MatchPreview(label: "Request header", value: "\($0.name): \($0.value)")
+        })
+        candidates.append(contentsOf: flow.responseHeaders.map {
+            MatchPreview(label: "Response header", value: "\($0.name): \($0.value)")
+        })
+        appendBody(
+            flow.requestBody,
+            label: "Request body",
+            curlFlag: flow.requestBody?.isText == true ? "--data-raw" : "--data-binary",
+            to: &candidates
+        )
+        appendBody(flow.responseBody, label: "Response body", curlFlag: nil, to: &candidates)
+
+        if let responseReason = flow.responseReason {
+            candidates.append(MatchPreview(label: "Response", value: responseReason))
+        }
+        if let mappedRuleName = flow.mappedRuleName {
+            candidates.append(MatchPreview(label: "Local Mapping", value: mappedRuleName))
+        }
+        if let error = flow.error {
+            candidates.append(MatchPreview(label: "Error", value: error))
+        }
+        candidates.append(contentsOf: flow.websocketMessages.map { frame in
+            let direction = frame.fromClient ? "client request outgoing" : "server response incoming"
+            return MatchPreview(
+                label: "WebSocket",
+                value: "\(direction) \(frame.timestamp) \(frame.content)"
+            )
+        })
+
+        if let context = flow.androidContext {
+            candidates.append(contentsOf: [
+                MatchPreview(label: "Android package", value: context.packageName),
+                MatchPreview(label: "Android process", value: context.processName),
+                MatchPreview(label: "Android thread", value: context.threadName),
+                MatchPreview(label: "Foreground Activity", value: context.foregroundActivity ?? ""),
+                MatchPreview(label: "Android call site", value: context.primaryCallSite?.displayName ?? ""),
+                MatchPreview(label: "Android stack", value: context.stackText),
+                MatchPreview(label: "Android match", value: context.status.rawValue),
+                MatchPreview(label: "Android confidence", value: context.confidence.rawValue)
+            ])
+        }
+
+        return candidates.first(where: { containsQuery($0.value) })
+    }
+
+    private func appendBody(
+        _ body: BodyPayload?,
+        label: String,
+        curlFlag: String?,
+        to candidates: inout [MatchPreview]
+    ) {
+        guard let body else { return }
+        if let mimeType = body.mimeType {
+            candidates.append(MatchPreview(label: label, value: mimeType))
+        }
+        if body.truncated {
+            candidates.append(MatchPreview(label: label, value: "truncated evicted"))
+        }
+        if let curlFlag {
+            candidates.append(MatchPreview(label: "cURL", value: curlFlag))
+        }
+        candidates.append(MatchPreview(label: label, value: body.text ?? body.hexPreview))
+    }
+
+    private func containsQuery(_ value: String) -> Bool {
+        value.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    private func contextualSnippet(_ value: String) -> String {
+        guard let match = value.range(
+            of: query,
+            options: [.caseInsensitive, .diacriticInsensitive]
+        ) else { return value }
+
+        let lowerBound = value.index(match.lowerBound, offsetBy: -70, limitedBy: value.startIndex) ?? value.startIndex
+        let upperBound = value.index(match.upperBound, offsetBy: 110, limitedBy: value.endIndex) ?? value.endIndex
+        let leadingEllipsis = lowerBound == value.startIndex ? "" : "…"
+        let trailingEllipsis = upperBound == value.endIndex ? "" : "…"
+        let excerpt = value[lowerBound..<upperBound]
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+        return leadingEllipsis + excerpt + trailingEllipsis
     }
 }
