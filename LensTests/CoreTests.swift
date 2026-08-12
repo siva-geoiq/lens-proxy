@@ -327,6 +327,42 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(store.filteredFlows.isEmpty)
     }
 
+    func testCurlCommandIncludesCapturedRequestAndShellEscapesValues() {
+        var flow = makeFlow(id: "curl", host: "api.example")
+        flow.method = "POST"
+        flow.url = "https://api.example/v1/search?query=lens test"
+        flow.requestHeaders = [
+            HeaderField(name: "Content-Type", value: "application/json"),
+            HeaderField(name: "X-Owner", value: "Lens's tester")
+        ]
+        flow.requestBody = BodyPayload(
+            data: Data("{\"name\":\"Lens's request\"}".utf8),
+            isText: true,
+            truncated: false,
+            mimeType: "application/json"
+        )
+
+        XCTAssertEqual(
+            flow.curlCommand,
+            "curl --request 'POST' --url 'https://api.example/v1/search?query=lens test' " +
+                "--header 'Content-Type: application/json' --header 'X-Owner: Lens'\\''s tester' " +
+                "--data-raw '{\"name\":\"Lens'\\''s request\"}'"
+        )
+    }
+
+    func testCurlCommandMarksBinaryBodyAsOmitted() {
+        var flow = makeFlow(id: "curl-binary", host: "upload.example")
+        flow.method = "PUT"
+        flow.requestBody = BodyPayload(
+            data: Data([0x00, 0xFF]),
+            isText: false,
+            truncated: false,
+            mimeType: "application/octet-stream"
+        )
+
+        XCTAssertTrue(flow.curlCommand.hasSuffix("--data-binary '<binary body omitted>'"))
+    }
+
     func testLoopbackFlowsAreAttributedToTheOnlyConnectedEmulator() {
         let store = CaptureStore()
         let flow = makeFlow(id: "emulator", host: "api.example")

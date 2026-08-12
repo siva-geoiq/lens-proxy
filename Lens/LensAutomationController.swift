@@ -319,15 +319,7 @@ final class LensAutomationController {
     }
 
     func curl(for flow: FlowRecord) -> String {
-        var parts = ["curl", "--request", shellQuote(flow.method), "--url", shellQuote(flow.url)]
-        for header in flow.requestHeaders {
-            parts += ["--header", shellQuote("\(header.name): \(header.value)")]
-        }
-        if let body = flow.requestBody, !body.data.isEmpty {
-            if let text = body.text { parts += ["--data-raw", shellQuote(text)] }
-            else { parts += ["--data-binary", "'<binary body omitted>'"] }
-        }
-        return parts.joined(separator: " ")
+        flow.curlCommand
     }
 
     func createMapping(from flowID: String, behavior: MappingBehavior) throws -> UUID {
@@ -484,7 +476,4 @@ final class LensAutomationController {
         }
     }
 
-    private func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
 }

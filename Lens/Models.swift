@@ -164,6 +164,21 @@ struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
         (requestBody?.data.count ?? 0) + (responseBody?.data.count ?? 0)
     }
 
+    var curlCommand: String {
+        var parts = ["curl", "--request", Self.shellQuote(method), "--url", Self.shellQuote(url)]
+        for header in requestHeaders {
+            parts += ["--header", Self.shellQuote("\(header.name): \(header.value)")]
+        }
+        if let body = requestBody, !body.data.isEmpty {
+            if let text = body.text {
+                parts += ["--data-raw", Self.shellQuote(text)]
+            } else {
+                parts += ["--data-binary", "'<binary body omitted>'"]
+            }
+        }
+        return parts.joined(separator: " ")
+    }
+
     func matchesGlobalSearch(_ rawQuery: String) -> Bool {
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return true }
@@ -185,7 +200,8 @@ struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
             "\(method) \(path) HTTP",
             "curl -X \(method)",
             "curl --request \(method)",
-            "curl --url \(url)"
+            "curl --url \(url)",
+            curlCommand
         ]
         let optionalMetadata: [String?] = [
             deviceID,
@@ -254,6 +270,10 @@ struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
             return text.localizedCaseInsensitiveContains(query)
         }
         return body.hexPreview.localizedCaseInsensitiveContains(query)
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 

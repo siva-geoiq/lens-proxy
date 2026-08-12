@@ -148,6 +148,7 @@ struct ResizableFlowTable: NSViewRepresentable {
             menu.addItem(withTitle: "Rewrite Request", action: #selector(rewriteRequest), keyEquivalent: "")
             menu.addItem(withTitle: "Map Local Response", action: #selector(mapLocalResponse), keyEquivalent: "")
             menu.addItem(.separator())
+            menu.addItem(withTitle: "Copy as cURL", action: #selector(copyCurl), keyEquivalent: "")
             menu.addItem(withTitle: "Copy URL", action: #selector(copyURL), keyEquivalent: "")
             for item in menu.items { item.target = self }
             return menu
@@ -165,8 +166,17 @@ struct ResizableFlowTable: NSViewRepresentable {
 
         @objc private func copyURL() {
             guard let contextualFlow else { return }
+            copyToPasteboard(contextualFlow.url)
+        }
+
+        @objc private func copyCurl() {
+            guard let contextualFlow else { return }
+            copyToPasteboard(contextualFlow.curlCommand)
+        }
+
+        private func copyToPasteboard(_ value: String) {
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(contextualFlow.url, forType: .string)
+            NSPasteboard.general.setString(value, forType: .string)
         }
 
         private func reusableTextCell(in tableView: NSTableView, identifier: NSUserInterfaceItemIdentifier) -> FlowTextCellView {
