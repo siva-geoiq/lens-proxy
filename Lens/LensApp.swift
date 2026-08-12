@@ -36,18 +36,18 @@ struct LensApp: App {
                 .task {
                     applicationDelegate.model = model
                     guard !isRunningUnitTests else { return }
-                    updates.start()
-                    model.startAutomationAPI()
                     if ProcessInfo.processInfo.arguments.contains("--ui-testing") {
                         model.prepareUITestFixture()
-                    } else {
-                        model.startEngine()
-#if DEBUG
-                        if let serial = endToEndDeviceSerial {
-                            await model.attachDeviceForEndToEndTest(serial: serial)
-                        }
-#endif
+                        return
                     }
+                    updates.start()
+                    model.startAutomationAPI()
+                    model.startEngine()
+#if DEBUG
+                    if let serial = endToEndDeviceSerial {
+                        await model.attachDeviceForEndToEndTest(serial: serial)
+                    }
+#endif
                 }
         }
         .commands {

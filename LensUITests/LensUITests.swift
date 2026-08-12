@@ -37,6 +37,21 @@ final class LensUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Attach"].isEnabled)
     }
 
+    func testGlobalSearchOverlaysFullscreenInspector() {
+        let app = launchApplication()
+
+        let maximizeResponse = app.buttons["Maximize Response inspector"]
+        XCTAssertTrue(maximizeResponse.waitForExistence(timeout: 3))
+        maximizeResponse.click()
+
+        app.typeKey("f", modifierFlags: .command)
+
+        let searchField = app.textFields["lens-global-search-field"]
+        XCTAssertTrue(searchField.waitForExistence(timeout: 2))
+        XCTAssertTrue(searchField.isHittable)
+        XCTAssertTrue(app.staticTexts["Search every captured flow"].exists)
+    }
+
     private func launchApplication() -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()

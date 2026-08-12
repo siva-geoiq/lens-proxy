@@ -9,39 +9,48 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var captures = model.captures
-        NavigationSplitView {
-            SidebarView()
-                .navigationSplitViewColumnWidth(min: 230, ideal: 280, max: 380)
-        } detail: {
-            VStack(spacing: 0) {
-                if let availableUpdate = updates.availableUpdate {
-                    LensUpdateBanner(update: availableUpdate)
-                    Divider()
-                }
-                if fullscreenInspector == nil {
-                    if let detachedDevice = model.detachedDevice {
-                        DeviceAttachmentBanner(device: detachedDevice)
+        ZStack(alignment: .top) {
+            NavigationSplitView {
+                SidebarView()
+                    .navigationSplitViewColumnWidth(min: 230, ideal: 280, max: 380)
+            } detail: {
+                VStack(spacing: 0) {
+                    if let availableUpdate = updates.availableUpdate {
+                        LensUpdateBanner(update: availableUpdate)
                         Divider()
                     }
-                    FlowFilterBar()
-                    Divider()
-                    VSplitView {
-                        FlowTableView()
-                            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 220)
+                    if fullscreenInspector == nil {
+                        if let detachedDevice = model.detachedDevice {
+                            DeviceAttachmentBanner(device: detachedDevice)
+                            Divider()
+                        }
+                        FlowFilterBar()
+                        Divider()
+                        VSplitView {
+                            FlowTableView()
+                                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 220)
+                            flowInspector(flow: captures.selectedFlow)
+                                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 260)
+                        }
+                        .frame(minWidth: 0, maxWidth: .infinity)
+                    } else {
                         flowInspector(flow: captures.selectedFlow)
-                            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 260)
+                            .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .frame(minWidth: 0, maxWidth: .infinity)
-                } else {
-                    flowInspector(flow: captures.selectedFlow)
-                        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+                    Divider()
+                    StatusBarView()
                 }
-                Divider()
-                StatusBarView()
+                .frame(minWidth: 0, maxWidth: .infinity)
             }
-            .frame(minWidth: 0, maxWidth: .infinity)
+
+            if captures.isGlobalSearchPresented {
+                GlobalSearchOverlay()
+                    .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+                    .zIndex(100)
+            }
         }
         .frame(minWidth: 1_180, minHeight: 720)
+        .animation(.easeOut(duration: 0.14), value: captures.isGlobalSearchPresented)
         .toolbar { toolbarContent }
         .sheet(isPresented: Bindable(model).showingMappings) {
             MappingManagerView()
