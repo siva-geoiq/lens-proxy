@@ -26,14 +26,17 @@ final class LensApplicationDelegate: NSObject, NSApplicationDelegate {
 struct LensApp: App {
     @NSApplicationDelegateAdaptor(LensApplicationDelegate.self) private var applicationDelegate
     @State private var model = LensModel()
+    @State private var updates = LensUpdateController()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(model)
+                .environment(updates)
                 .task {
                     applicationDelegate.model = model
                     guard !isRunningUnitTests else { return }
+                    updates.start()
                     model.startAutomationAPI()
                     if ProcessInfo.processInfo.arguments.contains("--ui-testing") {
                         model.prepareUITestFixture()
@@ -48,6 +51,12 @@ struct LensApp: App {
                 }
         }
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updates.checkForUpdates()
+                }
+                .disabled(!updates.canCheckForUpdates)
+            }
             CommandGroup(after: .newItem) {
                 Button("Open Session…") { model.openSession() }
                     .keyboardShortcut("o", modifiers: .command)

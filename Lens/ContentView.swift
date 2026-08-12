@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(LensModel.self) private var model
+    @Environment(LensUpdateController.self) private var updates
     @State private var fullscreenInspector: InspectorPane?
     @State private var requestInspectorTab = "Body"
     @State private var responseInspectorTab = "Body"
@@ -13,6 +14,10 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 230, ideal: 280, max: 380)
         } detail: {
             VStack(spacing: 0) {
+                if let availableUpdate = updates.availableUpdate {
+                    LensUpdateBanner(update: availableUpdate)
+                    Divider()
+                }
                 if fullscreenInspector == nil {
                     if let detachedDevice = model.detachedDevice {
                         DeviceAttachmentBanner(device: detachedDevice)
@@ -131,6 +136,42 @@ struct ContentView: View {
     }
 }
 
+private struct LensUpdateBanner: View {
+    @Environment(LensUpdateController.self) private var updates
+    let update: LensAvailableUpdate
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.title2)
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Lens \(update.version) is available")
+                    .font(.headline)
+                Text("Install the update and relaunch Lens when you’re ready.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 16)
+            Button("Later") {
+                updates.dismissAvailableUpdate()
+            }
+            .help("Dismiss this update reminder until Lens is relaunched")
+            Button("Install Update") {
+                updates.installAvailableUpdate()
+            }
+            .buttonStyle(.borderedProminent)
+            .help("Download, verify, install, and relaunch Lens")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.accentColor.opacity(0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Lens update \(update.version) is available")
+    }
+}
+
 private struct EngineStatusView: View {
     @Environment(LensModel.self) private var model
 
@@ -170,4 +211,5 @@ private struct EngineStatusView: View {
 #Preview {
     ContentView()
         .environment(LensModel())
+        .environment(LensUpdateController())
 }
