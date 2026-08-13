@@ -40,3 +40,13 @@ Check `data.androidDeepInspection.available` in `/v1/capabilities`. Read `/v1/de
 ```
 
 Treat foreground Activity as observational. Use a call site only when the flow carries a high-confidence Android context; do not infer ownership from timestamps alone.
+
+## Inspect or edit Shared Preferences
+
+1. Refresh devices and choose the exact ADB serial. Proxy attachment is not required.
+2. Check `data.androidSharedPreferences.available` in `/v1/capabilities`, then list `/v1/devices/{serial}/shared-preferences/apps`.
+3. Fetch the exact package and retain its `ETag`. Narrow to a file or key before displaying values because preferences may contain credentials or personal data.
+4. Build an apply body containing complete typed `entries` arrays for changed existing files only. Preserve `long` values as decimal strings.
+5. POST the body to `/v1/devices/{serial}/shared-preferences/{package}/apply` with `--if-match`, a unique `--idempotency` value, and no confirmation initially.
+6. Show the returned confirmation summary to the user. Only after approval, repeat the identical request with `--confirm`.
+7. Poll the operation. If the revision changed, fetch the package again and rebuild the edit instead of merging against stale data.

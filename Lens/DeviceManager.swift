@@ -8,19 +8,67 @@ struct CommandResult: Sendable {
     var status: Int32
 }
 
+private final class CommandOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func store(_ value: Data) {
+        lock.withLock { data = value }
+    }
+
+    func value() -> Data {
+        lock.withLock { data }
+    }
+}
+
+protocol AndroidCommandRunning: Sendable {
+    func run(
+        _ executable: URL,
+        arguments: [String],
+        input: Data?,
+        timeout: TimeInterval?
+    ) async throws -> CommandResult
+}
+
 final class CommandRunner: @unchecked Sendable {
-    func run(_ executable: URL, arguments: [String], timeout: TimeInterval? = nil) async throws -> CommandResult {
+    func run(
+        _ executable: URL,
+        arguments: [String],
+        input: Data? = nil,
+        timeout: TimeInterval? = nil
+    ) async throws -> CommandResult {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
                 let output = Pipe()
                 let error = Pipe()
+                let standardInput = input.map { _ in Pipe() }
+                let outputBuffer = CommandOutputBuffer()
+                let errorBuffer = CommandOutputBuffer()
+                let readers = DispatchGroup()
                 process.executableURL = executable
                 process.arguments = arguments
                 process.standardOutput = output
                 process.standardError = error
+                process.standardInput = standardInput
                 do {
                     try process.run()
+                    readers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+                        outputBuffer.store(output.fileHandleForReading.readDataToEndOfFile())
+                        readers.leave()
+                    }
+                    readers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+                        errorBuffer.store(error.fileHandleForReading.readDataToEndOfFile())
+                        readers.leave()
+                    }
+                    if let input, let standardInput {
+            DispatchQueue.global(qos: .userInitiated).async {
+                            try? standardInput.fileHandleForWriting.write(contentsOf: input)
+                            try? standardInput.fileHandleForWriting.close()
+                        }
+                    }
                     if let timeout {
                         let deadline = Date().addingTimeInterval(timeout)
                         while process.isRunning && Date() < deadline {
@@ -36,14 +84,16 @@ final class CommandRunner: @unchecked Sendable {
                                 kill(process.processIdentifier, SIGKILL)
                                 process.waitUntilExit()
                             }
+                            readers.wait()
                             continuation.resume(throwing: CommandRunnerError.timedOut(executable.lastPathComponent, timeout))
                             return
                         }
                     } else {
                         process.waitUntilExit()
                     }
-                    let outputData = output.fileHandleForReading.readDataToEndOfFile()
-                    let errorData = error.fileHandleForReading.readDataToEndOfFile()
+                    readers.wait()
+                    let outputData = outputBuffer.value()
+                    let errorData = errorBuffer.value()
                     continuation.resume(
                         returning: CommandResult(
                             output: String(data: outputData, encoding: .utf8) ?? "",
@@ -58,6 +108,8 @@ final class CommandRunner: @unchecked Sendable {
         }
     }
 }
+
+extension CommandRunner: AndroidCommandRunning {}
 
 @MainActor
 @Observable

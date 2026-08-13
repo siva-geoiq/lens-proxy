@@ -12,6 +12,7 @@ final class LensModel {
     let mappings: MappingStore
     let devices: DeviceManager
     let inspector: AndroidInspectorManager
+    let sharedPreferences: AndroidSharedPreferencesService
     @ObservationIgnored lazy var automation = LensAutomationController(model: self)
     @ObservationIgnored lazy var apiServer = LensAPIServer(controller: automation)
 
@@ -41,6 +42,7 @@ final class LensModel {
         mappings: MappingStore = MappingStore(),
         devices: DeviceManager = DeviceManager(),
         inspector: AndroidInspectorManager = AndroidInspectorManager(),
+        sharedPreferences: AndroidSharedPreferencesService = AndroidSharedPreferencesService(),
         engine: EngineProcessManager = EngineProcessManager(),
         bridge: BridgeClient = BridgeClient()
     ) {
@@ -48,6 +50,7 @@ final class LensModel {
         self.mappings = mappings
         self.devices = devices
         self.inspector = inspector
+        self.sharedPreferences = sharedPreferences
         self.engine = engine
         self.bridge = bridge
         let storedPort = UserDefaults.standard.integer(forKey: "proxyPort")

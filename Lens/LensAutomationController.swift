@@ -243,6 +243,10 @@ final class LensAutomationController {
                 "available": .bool(inspectionProvider.isAvailable),
                 "version": .number(1)
             ]),
+            "androidSharedPreferences": .object([
+                "available": .bool(true),
+                "version": .number(1)
+            ]),
             "pinned": .bool(false),
             "savedSidebar": .bool(false)
         ])
@@ -456,6 +460,56 @@ final class LensAutomationController {
         case .off: ("off", nil)
         }
         try? setInspection(serial: device.serial, mode: values.0, package: values.1)
+    }
+
+    func sharedPreferenceApps(serial: String) async throws -> [String] {
+        _ = try device(serial: serial)
+        return try await model.sharedPreferences.discoverApps(deviceSerial: serial)
+    }
+
+    func sharedPreferencePackage(
+        serial: String,
+        packageName: String
+    ) async throws -> AndroidPreferencePackageSnapshot {
+        _ = try device(serial: serial)
+        return try await model.sharedPreferences.loadPackage(deviceSerial: serial, packageName: packageName)
+    }
+
+    func sharedPreferenceFile(
+        serial: String,
+        packageName: String,
+        fileName: String
+    ) async throws -> (AndroidPreferenceFile, String) {
+        _ = try device(serial: serial)
+        return try await model.sharedPreferences.loadFile(
+            deviceSerial: serial,
+            packageName: packageName,
+            fileName: fileName
+        )
+    }
+
+    func applySharedPreferences(
+        serial: String,
+        packageName: String,
+        expectedRevision: String,
+        replacements: [AndroidPreferenceFileReplacement]
+    ) async throws -> AndroidPreferenceApplyResult {
+        _ = try device(serial: serial)
+        let result = try await model.sharedPreferences.apply(
+            deviceSerial: serial,
+            packageName: packageName,
+            expectedRevision: expectedRevision,
+            replacements: replacements
+        )
+        publish(
+            type: "sharedPreferences.changed",
+            payload: .object([
+                "deviceId": .string(serial),
+                "package": .string(packageName),
+                "changedFileCount": .number(Double(result.changedFileCount))
+            ])
+        )
+        return result
     }
 
     func requestAttach(_ device: DeviceTarget, stopConflictingVPN: Bool = false) {
