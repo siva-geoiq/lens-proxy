@@ -1,9 +1,11 @@
 import SwiftUI
 
 struct GlobalSearchOverlay: View {
-    private struct MatchPreview {
-        let label: String
-        let value: String
+    private struct DisplayResult: Identifiable {
+        let match: FlowSearchMatch
+        let flow: FlowRecord
+
+        var id: String { match.flowID }
     }
 
     @Environment(LensModel.self) private var model
@@ -14,11 +16,14 @@ struct GlobalSearchOverlay: View {
         model.captures.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private var results: [FlowRecord] {
-        query.isEmpty ? [] : model.captures.filteredFlows
+    private var results: [DisplayResult] {
+        guard !query.isEmpty else { return [] }
+        return model.captures.searchMatches.compactMap { match in
+            model.captures.flow(id: match.flowID).map { DisplayResult(match: match, flow: $0) }
+        }
     }
 
-    private var visibleResults: [FlowRecord] {
+    private var visibleResults: [DisplayResult] {
         Array(results.prefix(8))
     }
 
@@ -69,6 +74,12 @@ struct GlobalSearchOverlay: View {
                         .help("Clear global search")
                     }
 
+                    if captures.searchPhase == .searching {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityLabel("Searching captured flows")
+                    }
+
                     Text("esc")
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
@@ -98,6 +109,9 @@ struct GlobalSearchOverlay: View {
             highlightedFlowID = visibleResults.first?.id
         }
         .onChange(of: captures.searchText) {
+            highlightedFlowID = nil
+        }
+        .onChange(of: captures.searchMatches) {
             highlightedFlowID = visibleResults.first?.id
         }
     }
@@ -119,6 +133,17 @@ struct GlobalSearchOverlay: View {
                 Spacer()
             }
             .padding(20)
+        } else if model.captures.searchPhase == .searching, results.isEmpty {
+            VStack(spacing: 12) {
+                ProgressView()
+                    .controlSize(.regular)
+                Text("Searching captured flows…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 150)
+            .accessibilityElement(children: .combine)
         } else if results.isEmpty {
             ContentUnavailableView(
                 "No matching flows",
@@ -128,9 +153,9 @@ struct GlobalSearchOverlay: View {
             .frame(height: 150)
         } else {
             VStack(spacing: 0) {
-                ForEach(visibleResults) { flow in
-                    resultRow(flow)
-                    if flow.id != visibleResults.last?.id {
+                ForEach(visibleResults) { result in
+                    resultRow(result)
+                    if result.id != visibleResults.last?.id {
                         Divider().padding(.leading, 82)
                     }
                 }
@@ -144,14 +169,23 @@ struct GlobalSearchOverlay: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 20)
                         .padding(.vertical, 9)
+                } else if model.captures.searchPhase == .searching {
+                    Divider()
+                    Label("Updating results", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 9)
                 }
             }
         }
     }
 
-    private func resultRow(_ flow: FlowRecord) -> some View {
-        Button {
-            open(flow)
+    private func resultRow(_ result: DisplayResult) -> some View {
+        let flow = result.flow
+        return Button {
+            open(result)
         } label: {
             HStack(spacing: 12) {
                 highlightedText(flow.method)
@@ -176,11 +210,11 @@ struct GlobalSearchOverlay: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
-                    if let preview = matchPreview(for: flow) {
+                    if let preview = result.match.preview {
                         HStack(spacing: 5) {
-                            highlightedText(preview.label)
+                            highlightedText(result.match.field.label)
                                 .fontWeight(.semibold)
-                            highlightedText(contextualSnippet(preview.value))
+                            highlightedText(preview)
                         }
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -229,12 +263,12 @@ struct GlobalSearchOverlay: View {
     }
 
     private func openHighlightedResult() {
-        guard let flow = visibleResults.first(where: { $0.id == highlightedFlowID }) ?? visibleResults.first else { return }
-        open(flow)
+        guard let result = visibleResults.first(where: { $0.id == highlightedFlowID }) ?? visibleResults.first else { return }
+        open(result)
     }
 
-    private func open(_ flow: FlowRecord) {
-        model.captures.selectedFlowID = flow.id
+    private func open(_ result: DisplayResult) {
+        model.captures.selectedFlowID = result.flow.id
         model.captures.dismissGlobalSearch()
     }
 
@@ -249,142 +283,14 @@ struct GlobalSearchOverlay: View {
                 options: [.caseInsensitive, .diacriticInsensitive],
                 range: searchStart..<value.endIndex
               ) {
-            output = output + Text(String(value[searchStart..<match.lowerBound]))
-            output = output + Text(String(value[match]))
+            output = Text("\(output)\(Text(String(value[searchStart..<match.lowerBound])))")
+            let highlightedMatch = Text(String(value[match]))
                 .bold()
                 .foregroundColor(.accentColor)
+            output = Text("\(output)\(highlightedMatch)")
             searchStart = match.upperBound
         }
-        return output + Text(String(value[searchStart...]))
+        return Text("\(output)\(Text(String(value[searchStart...])))")
     }
 
-    private func matchPreview(for flow: FlowRecord) -> MatchPreview? {
-        let visibleValues = [
-            flow.method,
-            flow.displayURL,
-            flow.clientDisplayName,
-            flow.statusText,
-            flow.responseBody?.mimeType ?? flow.requestBody?.mimeType ?? ""
-        ]
-        if visibleValues.contains(where: containsQuery) {
-            return nil
-        }
-
-        var candidates: [MatchPreview] = [
-            MatchPreview(label: "Flow ID", value: flow.id),
-            MatchPreview(label: "Client address", value: flow.clientAddress),
-            MatchPreview(label: "Scheme", value: flow.scheme),
-            MatchPreview(label: "Host", value: flow.host),
-            MatchPreview(label: "Port", value: String(flow.port)),
-            MatchPreview(label: "Path", value: flow.path),
-            MatchPreview(label: "Raw URL", value: flow.url),
-            MatchPreview(label: "Size", value: String(flow.size)),
-            MatchPreview(label: "Started", value: String(flow.startedAt)),
-            MatchPreview(label: "Request line", value: "\(flow.method) \(flow.path) HTTP"),
-            MatchPreview(label: "cURL", value: flow.curlCommand),
-            MatchPreview(label: "cURL", value: "curl -X \(flow.method)")
-        ]
-
-        if let deviceID = flow.deviceID {
-            candidates.append(MatchPreview(label: "Device ID", value: deviceID))
-        }
-        if let deviceName = flow.deviceName {
-            candidates.append(MatchPreview(label: "Device", value: deviceName))
-        }
-        if let endedAt = flow.endedAt {
-            candidates.append(MatchPreview(label: "Ended", value: String(endedAt)))
-        }
-        if let duration = flow.duration {
-            candidates.append(MatchPreview(label: "Duration", value: String(duration)))
-        }
-        if let mappedRuleID = flow.mappedRuleID {
-            candidates.append(MatchPreview(label: "Local Mapping ID", value: mappedRuleID.uuidString))
-        }
-
-        candidates.append(contentsOf: flow.requestHeaders.map {
-            MatchPreview(label: "Request header", value: "\($0.name): \($0.value)")
-        })
-        candidates.append(contentsOf: flow.responseHeaders.map {
-            MatchPreview(label: "Response header", value: "\($0.name): \($0.value)")
-        })
-        appendBody(
-            flow.requestBody,
-            label: "Request body",
-            curlFlag: flow.requestBody?.isText == true ? "--data-raw" : "--data-binary",
-            to: &candidates
-        )
-        appendBody(flow.responseBody, label: "Response body", curlFlag: nil, to: &candidates)
-
-        if let responseReason = flow.responseReason {
-            candidates.append(MatchPreview(label: "Response", value: responseReason))
-        }
-        if let mappedRuleName = flow.mappedRuleName {
-            candidates.append(MatchPreview(label: "Local Mapping", value: mappedRuleName))
-        }
-        if let error = flow.error {
-            candidates.append(MatchPreview(label: "Error", value: error))
-        }
-        candidates.append(contentsOf: flow.websocketMessages.map { frame in
-            let direction = frame.fromClient ? "client request outgoing" : "server response incoming"
-            return MatchPreview(
-                label: "WebSocket",
-                value: "\(direction) \(frame.timestamp) \(frame.content)"
-            )
-        })
-
-        if let context = flow.androidContext {
-            candidates.append(contentsOf: [
-                MatchPreview(label: "Android package", value: context.packageName),
-                MatchPreview(label: "Android process", value: context.processName),
-                MatchPreview(label: "Android thread", value: context.threadName),
-                MatchPreview(label: "Foreground Activity", value: context.foregroundActivity ?? ""),
-                MatchPreview(label: "Android call site", value: context.primaryCallSite?.displayName ?? ""),
-                MatchPreview(label: "Android stack", value: context.stackText),
-                MatchPreview(label: "Android match", value: context.status.rawValue),
-                MatchPreview(label: "Android confidence", value: context.confidence.rawValue)
-            ])
-        }
-
-        return candidates.first(where: { containsQuery($0.value) })
-    }
-
-    private func appendBody(
-        _ body: BodyPayload?,
-        label: String,
-        curlFlag: String?,
-        to candidates: inout [MatchPreview]
-    ) {
-        guard let body else { return }
-        if let mimeType = body.mimeType {
-            candidates.append(MatchPreview(label: label, value: mimeType))
-        }
-        if body.truncated {
-            candidates.append(MatchPreview(label: label, value: "truncated evicted"))
-        }
-        if let curlFlag {
-            candidates.append(MatchPreview(label: "cURL", value: curlFlag))
-        }
-        candidates.append(MatchPreview(label: label, value: body.text ?? body.hexPreview))
-    }
-
-    private func containsQuery(_ value: String) -> Bool {
-        value.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
-    }
-
-    private func contextualSnippet(_ value: String) -> String {
-        guard let match = value.range(
-            of: query,
-            options: [.caseInsensitive, .diacriticInsensitive]
-        ) else { return value }
-
-        let lowerBound = value.index(match.lowerBound, offsetBy: -70, limitedBy: value.startIndex) ?? value.startIndex
-        let upperBound = value.index(match.upperBound, offsetBy: 110, limitedBy: value.endIndex) ?? value.endIndex
-        let leadingEllipsis = lowerBound == value.startIndex ? "" : "…"
-        let trailingEllipsis = upperBound == value.endIndex ? "" : "…"
-        let excerpt = value[lowerBound..<upperBound]
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\r", with: " ")
-            .replacingOccurrences(of: "\t", with: " ")
-        return leadingEllipsis + excerpt + trailingEllipsis
-    }
 }

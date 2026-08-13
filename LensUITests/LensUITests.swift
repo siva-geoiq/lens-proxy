@@ -50,6 +50,10 @@ final class LensUITests: XCTestCase {
         XCTAssertTrue(searchField.waitForExistence(timeout: 2))
         XCTAssertTrue(searchField.isHittable)
         XCTAssertTrue(app.staticTexts["Search every captured flow"].exists)
+
+        searchField.typeText("definitely-not-in-the-capture")
+        XCTAssertTrue(app.staticTexts["No matching flows"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["0/1 flows"].exists)
     }
 
     private func launchApplication() -> XCUIApplication {

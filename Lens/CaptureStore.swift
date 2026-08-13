@@ -1,24 +1,46 @@
 import Foundation
 import Observation
 
+enum GlobalSearchPhase: Equatable, Sendable {
+    case idle
+    case searching
+    case completed
+}
+
 @MainActor
 @Observable
 final class CaptureStore {
     private(set) var flows: [FlowRecord] = []
     var selectedFlowID: String?
     var selectedScope: CaptureScope? = .allTraffic
-    var searchText = ""
+    var searchText = "" {
+        didSet {
+            guard searchText != oldValue else { return }
+            searchQueryDidChange()
+        }
+    }
     private(set) var isGlobalSearchPresented = false
     private(set) var globalSearchFocusRequest = 0
+    private(set) var searchPhase: GlobalSearchPhase = .idle
+    private(set) var searchMatches: [FlowSearchMatch] = []
+    private(set) var captureRevision: UInt64 = 0
     var selectedKind: FlowKind = .all
     var isCapturePaused = false
     private var indexByID: [String: Int] = [:]
     private var totalBodyBytes = 0
+    @ObservationIgnored private let searchService: FlowSearchService
+    @ObservationIgnored private var searchTask: Task<Void, Never>?
+    private(set) var searchGeneration: UInt64 = 0
+    @ObservationIgnored private var searchNeedsRefresh = false
 
     let maximumBodyBytes: Int
 
-    init(maximumBodyBytes: Int = 500 * 1024 * 1024) {
+    init(
+        maximumBodyBytes: Int = 500 * 1024 * 1024,
+        searchService: FlowSearchService = FlowSearchService()
+    ) {
         self.maximumBodyBytes = maximumBodyBytes
+        self.searchService = searchService
     }
 
     var selectedFlow: FlowRecord? {
@@ -37,11 +59,7 @@ final class CaptureStore {
     }
 
     var filteredFlows: [FlowRecord] {
-        let needle = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isGlobalSearchPresented, !needle.isEmpty {
-            return flows.filter { $0.matchesGlobalSearch(needle) }
-        }
-        return flows.filter { flow in
+        flows.filter { flow in
             let matchesScope = switch selectedScope ?? .allTraffic {
             case .allTraffic: true
             case .local: flow.deviceID == nil
@@ -73,11 +91,23 @@ final class CaptureStore {
     func presentGlobalSearch() {
         isGlobalSearchPresented = true
         globalSearchFocusRequest &+= 1
+        searchQueryDidChange()
     }
 
     func dismissGlobalSearch() {
-        searchText = ""
         isGlobalSearchPresented = false
+        searchText = ""
+    }
+
+    func flow(id: String) -> FlowRecord? {
+        guard let index = indexByID[id], flows.indices.contains(index) else { return nil }
+        return flows[index]
+    }
+
+    func search(query: String, in flows: [FlowRecord]) async -> FlowSearchResult {
+        await searchService.search(
+            FlowSearchRequest(query: query, flows: flows, captureRevision: captureRevision)
+        )
     }
 
     private func isOther(_ flow: FlowRecord) -> Bool {
@@ -98,12 +128,19 @@ final class CaptureStore {
             totalBodyBytes += flow.bodyByteCount
         }
         evictBodiesIfNeeded()
+        captureDidChange()
     }
 
     func attributeFlows(to devices: [DeviceTarget]) {
+        var didChange = false
         for index in flows.indices {
-            flows[index] = attributed(flows[index], to: devices)
+            let updated = attributed(flows[index], to: devices)
+            guard updated.deviceID != flows[index].deviceID ||
+                    updated.deviceName != flows[index].deviceName else { continue }
+            flows[index] = updated
+            didChange = true
         }
+        if didChange { captureDidChange() }
     }
 
     func attributed(_ flow: FlowRecord, to devices: [DeviceTarget]) -> FlowRecord {
@@ -124,6 +161,13 @@ final class CaptureStore {
         totalBodyBytes = 0
         selectedFlowID = nil
         selectedScope = .allTraffic
+        captureRevision &+= 1
+        searchTask?.cancel()
+        searchTask = nil
+        searchGeneration &+= 1
+        searchMatches = []
+        searchNeedsRefresh = false
+        searchPhase = isGlobalSearchActive ? .completed : .idle
     }
 
     private func isLoopback(_ address: String) -> Bool {
@@ -143,5 +187,76 @@ final class CaptureStore {
             }
             totalBodyBytes -= removedBytes
         }
+    }
+
+    private func searchQueryDidChange() {
+        searchGeneration &+= 1
+        searchTask?.cancel()
+        searchNeedsRefresh = false
+        searchMatches = []
+
+        let query = normalizedSearchText
+        guard isGlobalSearchPresented, !query.isEmpty else {
+            searchPhase = .idle
+            searchTask = nil
+            return
+        }
+        searchPhase = .searching
+        startSearch(query: query, generation: searchGeneration, debounce: .milliseconds(150))
+    }
+
+    private func captureDidChange() {
+        captureRevision &+= 1
+        guard isGlobalSearchActive else { return }
+        searchNeedsRefresh = true
+        guard searchPhase != .searching else { return }
+        searchPhase = .searching
+        startSearch(query: normalizedSearchText, generation: searchGeneration, debounce: .milliseconds(75))
+    }
+
+    private func startSearch(query: String, generation: UInt64, debounce: Duration) {
+        searchTask?.cancel()
+        let service = searchService
+        searchTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: debounce)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled,
+                  self.isGlobalSearchPresented,
+                  generation == self.searchGeneration,
+                  query == self.normalizedSearchText else { return }
+
+            let request = FlowSearchRequest(
+                query: query,
+                flows: self.flows,
+                captureRevision: self.captureRevision
+            )
+            self.searchNeedsRefresh = false
+            let result = await service.search(request)
+            guard !Task.isCancelled else { return }
+            self.completeSearch(result, generation: generation)
+        }
+    }
+
+    private func completeSearch(_ result: FlowSearchResult, generation: UInt64) {
+        guard isGlobalSearchPresented,
+              generation == searchGeneration,
+              result.query == normalizedSearchText else { return }
+
+        if searchNeedsRefresh || result.captureRevision != captureRevision {
+            searchPhase = .searching
+            startSearch(query: normalizedSearchText, generation: generation, debounce: .milliseconds(75))
+            return
+        }
+
+        searchMatches = result.matches.filter { indexByID[$0.flowID] != nil }
+        searchPhase = .completed
+        searchTask = nil
+    }
+
+    private var normalizedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -281,12 +281,12 @@ final class LensAPIRouter {
             return .json(value: .object(["removeConditionalHeaders": .bool(input.removeConditionalHeaders)]), requestID: requestID)
         }
         if request.method == "GET", components == ["v1", "flows"] {
-            return try flowList(request, requestID: requestID)
+            return try await flowList(request, requestID: requestID)
         }
         if request.method == "GET", components == ["v1", "search"] {
             var query = request.query
             query["search"] = query["q"] ?? ""
-            let matches = controller.filteredFlows(query: query).map(LensFlowSummary.init)
+            let matches = await controller.filteredFlows(query: query).map(LensFlowSummary.init)
             return .json(value: try JSONValue(["items": matches]), requestID: requestID)
         }
         if components.count >= 3, components[0] == "v1", components[1] == "flows" {
@@ -346,8 +346,8 @@ final class LensAPIRouter {
         throw LensAPIProblem.notFound("No API route matches \(request.method) \(request.path).")
     }
 
-    private func flowList(_ request: LensHTTPRequest, requestID: String) throws -> LensHTTPResponse {
-        let flows = controller.filteredFlows(query: request.query)
+    private func flowList(_ request: LensHTTPRequest, requestID: String) async throws -> LensHTTPResponse {
+        let flows = await controller.filteredFlows(query: request.query)
         let limit = min(max(Int(request.query["limit"] ?? "100") ?? 100, 1), 500)
         let offset = decodeCursor(request.query["cursor"]) ?? 0
         guard offset <= flows.count else { throw LensAPIProblem.badRequest("The flow cursor is invalid.") }

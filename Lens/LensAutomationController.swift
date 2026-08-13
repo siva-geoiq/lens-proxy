@@ -296,7 +296,7 @@ final class LensAutomationController {
         return flow
     }
 
-    func filteredFlows(query: [String: String]) -> [FlowRecord] {
+    func filteredFlows(query: [String: String]) async -> [FlowRecord] {
         var flows = model.captures.flows
         if let deviceID = query["deviceId"] { flows = flows.filter { $0.deviceID == deviceID } }
         if let host = query["host"] { flows = flows.filter { $0.host.caseInsensitiveCompare(host) == .orderedSame } }
@@ -314,7 +314,11 @@ final class LensAutomationController {
                 }
             }
         }
-        if let search = query["search"], !search.isEmpty { flows = flows.filter { $0.matchesGlobalSearch(search) } }
+        if let search = query["search"], !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let result = await model.captures.search(query: search, in: flows)
+            let matchingIDs = Set(result.matches.map(\.flowID))
+            flows = flows.filter { matchingIDs.contains($0.id) }
+        }
         return flows.sorted { $0.startedAt > $1.startedAt }
     }
 

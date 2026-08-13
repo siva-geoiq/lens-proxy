@@ -26,28 +26,19 @@ struct FlowTableView: View {
 
     var body: some View {
         let filteredFlows = model.captures.filteredFlows
-        if model.captures.isGlobalSearchActive, filteredFlows.isEmpty {
-            ContentUnavailableView(
-                "No Search Results",
-                systemImage: "magnifyingglass",
-                description: Text("No request or response content matches this query.")
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            ResizableFlowTable(
-                flows: filteredFlows,
-                selectedFlowID: model.captures.selectedFlowID,
-                onSelect: { model.captures.selectedFlowID = $0 },
-                onRewrite: { flow in
-                    model.captures.selectedFlowID = flow.id
-                    model.rewriteSelectedRequest()
-                },
-                onMapLocal: { flow in
-                    model.captures.selectedFlowID = flow.id
-                    model.mapSelectedFlow()
-                }
-            )
-            .accessibilityLabel("Captured network requests")
-        }
+        ResizableFlowTable(
+            flows: filteredFlows,
+            selectedFlowID: model.captures.selectedFlowID,
+            onSelect: { model.captures.selectedFlowID = $0 },
+            onRewrite: { flow in
+                model.captures.selectedFlowID = flow.id
+                model.rewriteSelectedRequest()
+            },
+            onMapLocal: { flow in
+                model.captures.selectedFlowID = flow.id
+                model.mapSelectedFlow()
+            }
+        )
+        .accessibilityLabel("Captured network requests")
     }
 }

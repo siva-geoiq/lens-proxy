@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import Lens
 
@@ -273,7 +274,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(store.rules.first?.rewriteBody, false)
     }
 
-    func testFlowFilteringByHostKindAndSearch() {
+    func testFlowFilteringByHostKindAndSearch() async {
         let store = CaptureStore()
         store.upsert(makeFlow(id: "json", host: "firebase.example", mimeType: "application/json"))
         store.upsert(makeFlow(id: "image", host: "cdn.example", mimeType: "image/png"))
@@ -284,12 +285,11 @@ final class CoreTests: XCTestCase {
         store.selectedScope = .host(deviceID: nil, name: "cdn.example")
         XCTAssertEqual(store.filteredFlows.map(\.id), ["image"])
         store.selectedScope = .allTraffic
-        store.presentGlobalSearch()
-        store.searchText = "firebase"
-        XCTAssertEqual(store.filteredFlows.map(\.id), ["json"])
+        let result = await store.search(query: "firebase", in: store.flows)
+        XCTAssertEqual(result.matches.map(\.flowID), ["json"])
     }
 
-    func testGlobalSearchScansAllFlowContentAndIgnoresSidebarScope() {
+    func testGlobalSearchScansAllFlowContentAndIgnoresSidebarScope() async {
         let store = CaptureStore()
         var flow = makeFlow(id: "searchable", host: "api.example", mimeType: "application/json")
         flow.clientAddress = "10.20.30.40"
@@ -315,16 +315,217 @@ final class CoreTests: XCTestCase {
             "Global Search Mapping",
             "socket-search-payload",
             "curl -X GET",
+            "curl --request GET",
+            "curl --url https://api.example/",
+            "--header 'X-Trace-ID: trace-abc-123'",
+            "-H 'X-Trace-ID: trace-abc-123'",
             "--data-raw"
         ]
         for query in queries {
-            store.searchText = query
-            XCTAssertEqual(store.filteredFlows.map(\.id), ["searchable"], "Expected a match for \(query)")
+            let result = await store.search(query: query, in: store.flows)
+            XCTAssertEqual(result.matches.map(\.flowID), ["searchable"], "Expected a match for \(query)")
         }
 
         store.dismissGlobalSearch()
         XCTAssertTrue(store.searchText.isEmpty)
         XCTAssertTrue(store.filteredFlows.isEmpty)
+    }
+
+    func testGlobalSearchPublishesOnlyLatestDebouncedQueryAndRefreshesForNewFlows() async {
+        let store = CaptureStore()
+        store.upsert(makeFlow(id: "firebase", host: "firebase.example"))
+        store.upsert(makeFlow(id: "cdn", host: "cdn.example"))
+        store.presentGlobalSearch()
+
+        store.searchText = "firebase"
+        store.searchText = "cdn"
+        let publishedLatestQuery = await waitForSearch(store, matching: ["cdn"])
+        XCTAssertTrue(publishedLatestQuery)
+
+        store.searchText = "arrived-later"
+        let publishedEmptyResult = await waitForSearch(store, matching: [])
+        XCTAssertTrue(publishedEmptyResult)
+        var newFlow = makeFlow(id: "live", host: "api.example")
+        newFlow.responseBody = BodyPayload(
+            data: Data(#"{"state":"arrived-later"}"#.utf8),
+            isText: true,
+            truncated: false,
+            mimeType: "application/json"
+        )
+        store.upsert(newFlow)
+
+        let refreshedForLiveFlow = await waitForSearch(store, matching: ["live"])
+        XCTAssertTrue(refreshedForLiveFlow)
+    }
+
+    func testGlobalSearchClearCancelsPendingWorkAndReleasesMatches() async {
+        let store = CaptureStore()
+        let body = Data(repeating: UInt8(ascii: "a"), count: 2 * 1024 * 1024)
+        for index in 0..<20 {
+            store.upsert(makeFlow(id: "large-\(index)", host: "api.example", body: body))
+        }
+        store.presentGlobalSearch()
+        store.searchText = "not-present"
+        store.clear()
+
+        try? await Task.sleep(for: .milliseconds(250))
+        XCTAssertTrue(store.searchMatches.isEmpty)
+        XCTAssertEqual(store.searchPhase, .completed)
+    }
+
+    func testFlowSearchHandlesDiacriticsBinaryHexAndBoundedBodyPreviews() async {
+        let service = FlowSearchService()
+        var unicode = makeFlow(
+            id: "unicode",
+            host: "api.example",
+            body: Data(#"{"label":"Café configuration"}"#.utf8)
+        )
+        unicode.responseBody?.isText = true
+        var binary = makeFlow(id: "binary", host: "cdn.example", body: Data([0xde, 0xad, 0xbe, 0xef]))
+        binary.responseBody?.isText = false
+        binary.requestBody = BodyPayload(
+            data: Data([0xca, 0xfe]),
+            isText: false,
+            truncated: false,
+            mimeType: "application/octet-stream"
+        )
+        let longBody = Data((String(repeating: "a", count: 2_000) + "needle" + String(repeating: "z", count: 2_000)).utf8)
+        let long = makeFlow(id: "long", host: "body.example", body: longBody)
+
+        let diacriticResult = await service.search(
+            FlowSearchRequest(query: "CAFE", flows: [unicode, binary, long], captureRevision: 1)
+        )
+        XCTAssertEqual(diacriticResult.matches.map(\.flowID), ["unicode"])
+
+        let binaryResult = await service.search(
+            FlowSearchRequest(query: "de ad be", flows: [unicode, binary, long], captureRevision: 1)
+        )
+        XCTAssertEqual(binaryResult.matches.map(\.flowID), ["binary"])
+
+        let binaryCurlResult = await service.search(
+            FlowSearchRequest(query: "--data-binary", flows: [unicode, binary, long], captureRevision: 1)
+        )
+        XCTAssertEqual(binaryCurlResult.matches.map(\.flowID), ["binary"])
+        XCTAssertEqual(binaryCurlResult.matches.first?.field, .curl)
+
+        let previewResult = await service.search(
+            FlowSearchRequest(query: "needle", flows: [unicode, binary, long], captureRevision: 1)
+        )
+        let preview = try? XCTUnwrap(previewResult.matches.first?.preview)
+        XCTAssertEqual(previewResult.matches.map(\.flowID), ["long"])
+        XCTAssertLessThan(preview?.count ?? .max, 220)
+    }
+
+    func testAutomationSearchUsesSharedServiceAfterStructuredFilters() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let captures = CaptureStore()
+        var matching = makeFlow(id: "matching", host: "api.example")
+        matching.responseBody = BodyPayload(
+            data: Data(#"{"needle":true}"#.utf8),
+            isText: true,
+            truncated: false,
+            mimeType: "application/json"
+        )
+        captures.upsert(matching)
+        captures.upsert(makeFlow(id: "other-host", host: "other.example", body: Data("needle".utf8)))
+        let model = LensModel(
+            captures: captures,
+            mappings: MappingStore(fileURL: directory.appendingPathComponent("mappings.json"))
+        )
+        let controller = LensAutomationController(model: model)
+
+        let result = await controller.filteredFlows(query: ["host": "api.example", "search": "needle"])
+        let whitespaceResult = await controller.filteredFlows(query: ["search": "   "])
+
+        XCTAssertEqual(result.map(\.id), ["matching"])
+        XCTAssertEqual(Set(whitespaceResult.map(\.id)), ["matching", "other-host"])
+    }
+
+    func testAutomationSearchDoesNotStallMainActorHeartbeat() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let captures = CaptureStore()
+        let body = Data(repeating: UInt8(ascii: "a"), count: 256 * 1024)
+        for index in 0..<200 {
+            var uniqueBody = body
+            uniqueBody[0] = UInt8(ascii: "a") + UInt8(index % 26)
+            captures.upsert(makeFlow(id: "api-perf-\(index)", host: "api.example", body: uniqueBody))
+        }
+        let model = LensModel(
+            captures: captures,
+            mappings: MappingStore(fileURL: directory.appendingPathComponent("mappings.json"))
+        )
+        let controller = LensAutomationController(model: model)
+        let heartbeat = expectation(description: "main actor remained responsive")
+
+        let searchTask = Task { @MainActor in
+            Task { @MainActor in heartbeat.fulfill() }
+            return await controller.filteredFlows(query: ["search": "not-present-anywhere"])
+        }
+
+        await fulfillment(of: [heartbeat], timeout: 0.05)
+        let result = await searchTask.value
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    func testFlowSearchHundredMegabyteBenchmarkAndMainActorDispatch() async {
+        let body = Data((String(repeating: "a", count: 256 * 1024 - 16) + "lens-perf-tail").utf8)
+        let flows = (0..<400).map { index in
+            var uniqueBody = body
+            uniqueBody[0] = UInt8(ascii: "a") + UInt8(index % 26)
+            return makeFlow(id: "perf-\(index)", host: "perf.example", body: uniqueBody)
+        }
+        let store = CaptureStore()
+        flows.forEach(store.upsert)
+        store.presentGlobalSearch()
+
+        let dispatchStart = ContinuousClock.now
+        store.searchText = "zzzz-not-present-anywhere"
+        let dispatchDuration = dispatchStart.duration(to: .now)
+        XCTAssertLessThan(seconds(dispatchDuration), 0.016)
+        store.dismissGlobalSearch()
+
+        let service = FlowSearchService()
+        var pageTouch: UInt8 = 0
+        for flow in flows {
+            flow.responseBody?.data.withUnsafeBytes { bytes in
+                for offset in stride(from: 0, to: bytes.count, by: 4_096) {
+                    pageTouch ^= bytes[offset]
+                }
+            }
+        }
+        XCTAssertNotEqual(pageTouch, UInt8.max)
+        let residentBeforeSearch = residentMemoryBytes()
+        let memoryMonitor = Task.detached { () -> UInt64 in
+            var peak = residentMemoryBytes()
+            while !Task.isCancelled {
+                peak = max(peak, residentMemoryBytes())
+                try? await Task.sleep(for: .milliseconds(1))
+            }
+            return peak
+        }
+        let searchStart = ContinuousClock.now
+        let result = await service.search(
+            FlowSearchRequest(query: "zzzz-not-present-anywhere", flows: flows, captureRevision: 1)
+        )
+        let searchDuration = searchStart.duration(to: .now)
+
+        XCTAssertTrue(result.matches.isEmpty)
+        XCTAssertLessThan(seconds(searchDuration), 0.25)
+
+        let tailSearchStart = ContinuousClock.now
+        let tailResult = await service.search(
+            FlowSearchRequest(query: "lens-perf-tail", flows: flows, captureRevision: 1)
+        )
+        let tailSearchDuration = tailSearchStart.duration(to: .now)
+        memoryMonitor.cancel()
+        let peakResidentMemory = await memoryMonitor.value
+
+        XCTAssertEqual(tailResult.matches.count, 400)
+        XCTAssertTrue(tailResult.matches.allSatisfy { $0.field == .responseBody })
+        XCTAssertLessThan(seconds(tailSearchDuration), 0.25)
+        XCTAssertLessThan(peakResidentMemory - residentBeforeSearch, 25 * 1024 * 1024)
     }
 
     func testCurlCommandIncludesCapturedRequestAndShellEscapesValues() {
@@ -516,7 +717,7 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(context?.stackFrames.isEmpty == true)
     }
 
-    func testAndroidContextSurvivesSessionEncodingAndParticipatesInGlobalSearch() throws {
+    func testAndroidContextSurvivesSessionEncodingAndParticipatesInGlobalSearch() async throws {
         var flow = makeFlow(id: "android-context", host: "api.example.com")
         flow.androidContext = AndroidRequestContext(
             status: .captured,
@@ -533,11 +734,16 @@ final class CoreTests: XCTestCase {
         )
 
         let decoded = try JSONDecoder().decode(FlowRecord.self, from: JSONEncoder().encode(flow))
+        let service = FlowSearchService()
 
         XCTAssertEqual(decoded.androidContext, flow.androidContext)
-        XCTAssertTrue(decoded.matchesGlobalSearch("HomeBottomNavActivity"))
-        XCTAssertTrue(decoded.matchesGlobalSearch("loadBottomNavigation"))
-        XCTAssertTrue(decoded.matchesGlobalSearch("HomeRepository.kt:142"))
+        for query in ["HomeBottomNavActivity", "loadBottomNavigation", "HomeRepository.kt:142"] {
+            let result = await service.search(
+                FlowSearchRequest(query: query, flows: [decoded], captureRevision: 1)
+            )
+            XCTAssertEqual(result.matches.map(\.flowID), [decoded.id])
+            XCTAssertEqual(result.matches.first?.field, .android)
+        }
     }
 
     func testRememberedEmulatorSurvivesCleanupUntilManuallyForgotten() throws {
@@ -736,6 +942,21 @@ final class CoreTests: XCTestCase {
         }
     }
 
+    private func waitForSearch(_ store: CaptureStore, matching expectedIDs: [String]) async -> Bool {
+        for _ in 0..<300 {
+            if store.searchPhase == .completed, store.searchMatches.map(\.flowID) == expectedIDs {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
+    private func seconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1_000_000_000_000_000_000
+    }
+
     private func makeRule(name: String = "Rule", path: String = "/v1/config", query: String? = nil) -> MappingRule {
         MappingRule(
             id: UUID(), name: name, enabled: true, order: 0, method: "POST", scheme: "https",
@@ -827,4 +1048,15 @@ final class CoreTests: XCTestCase {
             mappedRuleID: nil, mappedRuleName: nil, error: nil, websocketMessages: []
         )
     }
+}
+
+private func residentMemoryBytes() -> UInt64 {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size)
+    let status = withUnsafeMutablePointer(to: &info) { pointer in
+        pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { reboundPointer in
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), reboundPointer, &count)
+        }
+    }
+    return status == KERN_SUCCESS ? UInt64(info.resident_size) : 0
 }

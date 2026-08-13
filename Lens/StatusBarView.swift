@@ -5,7 +5,7 @@ struct StatusBarView: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            Text("\(model.captures.filteredFlows.count)/\(model.captures.flows.count) flows")
+            Text("\(visibleFlowCount)/\(model.captures.flows.count) flows")
             Text(ByteCountFormatter.string(fromByteCount: Int64(model.captures.flows.reduce(0) { $0 + $1.size }), countStyle: .file))
             if model.captures.isGlobalSearchActive {
                 Label("Global Search", systemImage: "magnifyingglass")
@@ -22,6 +22,12 @@ struct StatusBarView: View {
         .padding(.horizontal, 12)
         .frame(height: 30)
         .background(.bar)
+    }
+
+    private var visibleFlowCount: Int {
+        model.captures.isGlobalSearchActive
+            ? model.captures.searchMatches.count
+            : model.captures.filteredFlows.count
     }
 
     private func statusChip(_ text: String, active: Bool) -> some View {
