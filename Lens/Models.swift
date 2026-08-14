@@ -332,8 +332,41 @@ struct MappingRule: Codable, Hashable, Identifiable, Sendable {
               host.caseInsensitiveCompare(url.host ?? "") == .orderedSame else { return false }
         let requestPort = url.port ?? ((url.scheme?.lowercased() == "https") ? 443 : 80)
         guard port == requestPort,
-              path == (url.path.isEmpty ? "/" : url.path) else { return false }
+              Self.pathMatches(pattern: path, requestPath: url.path.isEmpty ? "/" : url.path) else { return false }
         return !matchQuery || (query ?? "") == (URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery ?? "")
+    }
+
+    static func pathMatches(pattern: String, requestPath: String) -> Bool {
+        guard pattern.contains("*") else { return pattern == requestPath }
+
+        var patternIndex = pattern.startIndex
+        var pathIndex = requestPath.startIndex
+        var wildcardIndex: String.Index?
+        var wildcardPathIndex: String.Index?
+
+        while pathIndex < requestPath.endIndex {
+            if patternIndex < pattern.endIndex, pattern[patternIndex] == requestPath[pathIndex] {
+                pattern.formIndex(after: &patternIndex)
+                requestPath.formIndex(after: &pathIndex)
+            } else if patternIndex < pattern.endIndex, pattern[patternIndex] == "*" {
+                wildcardIndex = patternIndex
+                pattern.formIndex(after: &patternIndex)
+                wildcardPathIndex = pathIndex
+            } else if let wildcardIndex, var retryPathIndex = wildcardPathIndex,
+                      retryPathIndex < requestPath.endIndex {
+                requestPath.formIndex(after: &retryPathIndex)
+                wildcardPathIndex = retryPathIndex
+                patternIndex = pattern.index(after: wildcardIndex)
+                pathIndex = retryPathIndex
+            } else {
+                return false
+            }
+        }
+
+        while patternIndex < pattern.endIndex, pattern[patternIndex] == "*" {
+            pattern.formIndex(after: &patternIndex)
+        }
+        return patternIndex == pattern.endIndex
     }
 
     static func sanitizedResponseHeaders(_ headers: [HeaderField]) -> [HeaderField] {

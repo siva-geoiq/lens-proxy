@@ -17,6 +17,8 @@ If attachment reports a VPN conflict, do not immediately retry with `stopConflic
 3. `GET /v1/mappings`, locate the returned ID, preserve its match fields and response headers, edit the response body/status, then `PUT` it with the current `ETag` in `If-Match`.
 4. Trigger the request again and verify `mappedRuleID` on the new flow.
 
+Use `*` in the mapping path to cover a family of endpoints. For example, `/v2/products/*` matches every descendant product path on the rule's exact method, scheme, host, and port. Leave `matchQuery` false to accept any query string. Put narrow exact mappings before broad wildcard mappings because the first enabled matching rule wins.
+
 ## Rewrite a request
 
 Create a mapping with `{"behavior":"rewriteRequest"}`. Set `rewriteHeaders` and/or `rewriteBody`; leave either false to pass that portion through unchanged. Trigger a fresh device request because rewrites apply before upstream transmission, not retroactively.

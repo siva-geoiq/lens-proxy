@@ -4,6 +4,64 @@ import XCTest
 
 @MainActor
 final class EngineDeviceEndToEndTests: XCTestCase {
+    func testWildcardMappingServesMultipleProductPaths() async throws {
+        let proxyPort = try unusedTCPPort()
+        let engine = EngineProcessManager()
+        let bridge = BridgeClient()
+        let mappingsUpdated = expectation(description: "Wildcard mapping accepted")
+        let responseBody = Data(#"{"source":"wildcard-mapping"}"#.utf8)
+        let rules = [
+            makeRule(
+                name: "Wildcard product mapping",
+                method: "GET",
+                scheme: "http",
+                host: "wildcard-mapping.lens.test",
+                port: 80,
+                path: "/v2/products/*",
+                body: responseBody,
+                order: 0
+            )
+        ]
+
+        bridge.onEnvelope = { envelope in
+            switch envelope.type {
+            case "authenticated":
+                bridge.send(type: "setMappings", payload: ["rules": rules], requestID: "wildcard-mappings")
+            case "mappingsUpdated":
+                mappingsUpdated.fulfill()
+            case "clientError", "engineError":
+                XCTFail(envelope.error?.message ?? "Unexpected bridge error")
+            default:
+                break
+            }
+        }
+
+        _ = try engine.start(
+            proxyPort: proxyPort,
+            onControlPort: { port, controlToken in
+                bridge.connect(port: port, token: controlToken)
+            },
+            onLog: { _ in },
+            onExit: { _ in }
+        )
+        defer {
+            bridge.disconnect()
+            engine.stop()
+        }
+
+        await fulfillment(of: [mappingsUpdated], timeout: 15)
+        for path in [
+            "/v2/products/137152/similar-products",
+            "/v2/products/category/eyeglasses"
+        ] {
+            let response = try await runCurl(
+                proxyPort: proxyPort,
+                arguments: ["http://wildcard-mapping.lens.test\(path)?page=0&page-size=30"]
+            )
+            XCTAssertEqual(response, responseBody)
+        }
+    }
+
     func testBridgeAcceptsLargeMappingSnapshotAndRemainsConnected() async throws {
         let proxyPort = try unusedTCPPort()
         let engine = EngineProcessManager()

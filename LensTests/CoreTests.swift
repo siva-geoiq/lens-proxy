@@ -277,6 +277,33 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(rule.matches(method: "POST", url: matchingQuery))
     }
 
+    func testMappingPathWildcardMatchesZeroOrMoreCharactersIncludingSlashes() throws {
+        var rule = makeRule(path: "/v2/products/*/similar-products")
+        rule.method = "GET"
+
+        XCTAssertTrue(rule.matches(
+            method: "GET",
+            url: try XCTUnwrap(URL(string: "https://example.com/v2/products/137152/similar-products"))
+        ))
+        XCTAssertTrue(rule.matches(
+            method: "GET",
+            url: try XCTUnwrap(URL(string: "https://example.com/v2/products/category/eyeglasses/similar-products"))
+        ))
+        XCTAssertFalse(rule.matches(
+            method: "GET",
+            url: try XCTUnwrap(URL(string: "https://example.com/v2/products/137152/details"))
+        ))
+
+        XCTAssertTrue(MappingRule.pathMatches(pattern: "/v2/products/*", requestPath: "/v2/products/137152"))
+        XCTAssertTrue(MappingRule.pathMatches(pattern: "/v2/products/*", requestPath: "/v2/products/category/eyeglasses"))
+        XCTAssertFalse(MappingRule.pathMatches(pattern: "/v2/products/*", requestPath: "/v2/products"))
+    }
+
+    func testMappingPathWildcardTreatsQuestionMarkAndBracketsLiterally() {
+        XCTAssertTrue(MappingRule.pathMatches(pattern: "/literal?/[id]/*", requestPath: "/literal?/[id]/value"))
+        XCTAssertFalse(MappingRule.pathMatches(pattern: "/literal?/[id]/*", requestPath: "/literal-x/i/value"))
+    }
+
     func testFirstEnabledMatchingRuleWins() throws {
         var disabled = makeRule(name: "Disabled")
         disabled.enabled = false

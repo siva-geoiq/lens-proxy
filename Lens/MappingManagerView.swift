@@ -200,7 +200,15 @@ private struct MappingEditorView: View {
                         TextField("Port", value: $editor.rule.port, format: .number).frame(width: 70)
                     }
                 }
-                TextField("Path", text: $editor.rule.path)
+                LabeledContent("Path") {
+                    VStack(alignment: .leading, spacing: 3) {
+                        TextField("Path", text: $editor.rule.path)
+                            .labelsHidden()
+                        Text("Use * to match any characters, including / — for example, /v2/products/*")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Toggle("Match query parameters", isOn: $editor.rule.matchQuery)
                 if editor.rule.matchQuery {
                     TextField("Query", text: Binding($editor.rule.query, replacingNilWith: ""))
