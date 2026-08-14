@@ -1,8 +1,62 @@
+import Darwin
 import XCTest
 @testable import Lens
 
 @MainActor
 final class EngineDeviceEndToEndTests: XCTestCase {
+    func testBridgeAcceptsLargeMappingSnapshotAndRemainsConnected() async throws {
+        let proxyPort = try unusedTCPPort()
+        let engine = EngineProcessManager()
+        let bridge = BridgeClient()
+        let mappingsUpdated = expectation(description: "Large mapping snapshot accepted")
+        let followUpCommandHandled = expectation(description: "Bridge remains connected")
+        let largeBody = Data(repeating: 0x41, count: 256 * 1024)
+        let rules = [
+            makeRule(
+                name: "Large bridge mapping",
+                method: "GET",
+                scheme: "https",
+                host: "large-mapping.lens.test",
+                port: 443,
+                path: "/payload",
+                body: largeBody,
+                order: 0
+            )
+        ]
+        XCTAssertGreaterThan(try JSONEncoder().encode(rules).count, 64 * 1024)
+
+        bridge.onEnvelope = { envelope in
+            switch envelope.type {
+            case "authenticated":
+                bridge.send(type: "setMappings", payload: ["rules": rules], requestID: "large-mappings")
+            case "mappingsUpdated":
+                mappingsUpdated.fulfill()
+                bridge.send(type: "setNoCaching", payload: ["enabled": true], requestID: "after-large-mappings")
+            case "noCachingState":
+                followUpCommandHandled.fulfill()
+            case "clientError", "engineError":
+                XCTFail(envelope.error?.message ?? "Unexpected bridge error")
+            default:
+                break
+            }
+        }
+
+        _ = try engine.start(
+            proxyPort: proxyPort,
+            onControlPort: { port, controlToken in
+                bridge.connect(port: port, token: controlToken)
+            },
+            onLog: { _ in },
+            onExit: { _ in }
+        )
+        defer {
+            bridge.disconnect()
+            engine.stop()
+        }
+
+        await fulfillment(of: [mappingsUpdated, followUpCommandHandled], timeout: 15)
+    }
+
     func testSharedPreferencesReadEditRelaunchAndRestore() async throws {
         let environment = ProcessInfo.processInfo.environment
         let markerURL = URL(fileURLWithPath: "/private/tmp/lens-run-shared-prefs-e2e")
@@ -266,6 +320,33 @@ final class EngineDeviceEndToEndTests: XCTestCase {
         )
         XCTAssertEqual(result.status, 0, result.errorOutput)
         return Data(result.output.utf8)
+    }
+
+    private func unusedTCPPort() throws -> Int {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw POSIXError(.EIO) }
+        defer { Darwin.close(descriptor) }
+        var address = sockaddr_in(
+            sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
+            sin_family: sa_family_t(AF_INET),
+            sin_port: 0,
+            sin_addr: in_addr(s_addr: INADDR_LOOPBACK.bigEndian),
+            sin_zero: (0, 0, 0, 0, 0, 0, 0, 0)
+        )
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let resolved = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(descriptor, $0, &length)
+            }
+        }
+        guard resolved == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        return Int(UInt16(bigEndian: address.sin_port))
     }
 
     private func shutdown(_ bridge: BridgeClient) async {

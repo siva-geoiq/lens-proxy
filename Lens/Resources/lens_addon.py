@@ -11,6 +11,10 @@ from mitmproxy import ctx, http, io, version
 
 PROTOCOL_VERSION = 2
 MAX_BODY_BYTES = 10 * 1024 * 1024
+# Mapping snapshots contain base64-encoded bodies and routinely exceed asyncio's
+# 64 KiB default. Keep an explicit upper bound and report larger commands without
+# dropping the authenticated control connection.
+MAX_CONTROL_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
 class LensAddon:
@@ -26,7 +30,12 @@ class LensAddon:
         self.broadcast_task = None
 
     async def running(self):
-        self.server = await asyncio.start_server(self.handle_client, "127.0.0.1", 0)
+        self.server = await asyncio.start_server(
+            self.handle_client,
+            "127.0.0.1",
+            0,
+            limit=MAX_CONTROL_MESSAGE_BYTES + 1,
+        )
         port = self.server.sockets[0].getsockname()[1]
         print(f"LENS_CONTROL_PORT={port}", flush=True)
         self.broadcast_task = asyncio.create_task(self.broadcast_events())
@@ -66,9 +75,24 @@ class LensAddon:
         authenticated = False
         try:
             while not reader.at_eof():
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    await self.write_error(
+                        writer,
+                        "command_too_large",
+                        f"Lens bridge commands must not exceed {MAX_CONTROL_MESSAGE_BYTES} bytes.",
+                    )
+                    continue
                 if not line:
                     break
+                if len(line) > MAX_CONTROL_MESSAGE_BYTES:
+                    await self.write_error(
+                        writer,
+                        "command_too_large",
+                        f"Lens bridge commands must not exceed {MAX_CONTROL_MESSAGE_BYTES} bytes.",
+                    )
+                    continue
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError as error:
