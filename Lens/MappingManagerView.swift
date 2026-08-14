@@ -3,6 +3,9 @@ import SwiftUI
 struct MappingManagerView: View {
     @Environment(LensModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @State private var pendingRule: MappingRule?
+    @State private var editorGeneration = 0
+    @State private var saveError: String?
 
     var body: some View {
         @Bindable var mappings = model.mappings
@@ -70,10 +73,16 @@ struct MappingManagerView: View {
         } detail: {
             if let id = mappings.selectedRuleID,
                let rule = mappings.rules.first(where: { $0.id == id }) {
-                MappingEditorView(rule: rule) { try? model.automation.updateMapping($0) }
-                    .id(rule.id)
+                MappingEditorView(rule: rule) { pendingRule = $0 }
+                    .id("\(rule.id.uuidString)-\(editorGeneration)")
             } else {
                 ContentUnavailableView("Select a mapping", systemImage: "arrow.triangle.branch", description: Text("Create a mapping or choose one from the sidebar."))
+            }
+        }
+        .onChange(of: mappings.selectedRuleID) { oldID, _ in
+            if savePendingRule(for: oldID) {
+                pendingRule = nil
+                editorGeneration += 1
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -82,33 +91,102 @@ struct MappingManagerView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button("Revert") { revertPendingRule() }
+                    .accessibilityIdentifier("mapping-editor-revert")
+                    .disabled(!hasPendingChanges)
+                Button("Save") { savePendingRule() }
+                    .keyboardShortcut("s", modifiers: .command)
+                    .accessibilityIdentifier("mapping-editor-save")
+                    .disabled(!hasPendingChanges)
+                Button("Done") { saveAndDismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("mapping-editor-done")
             }
             .padding(10)
             .background(.bar)
         }
+        .interactiveDismissDisabled(hasPendingChanges)
+        .alert("Mapping could not be saved", isPresented: Binding(
+            get: { saveError != nil },
+            set: { if !$0 { saveError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(saveError ?? "Unknown error")
+        }
+    }
+
+    private var hasPendingChanges: Bool {
+        guard let pendingRule,
+              let storedRule = model.mappings.rules.first(where: { $0.id == pendingRule.id }) else { return false }
+        return pendingRule != storedRule
+    }
+
+    @discardableResult
+    private func savePendingRule(for ruleID: UUID? = nil) -> Bool {
+        guard let pendingRule,
+              ruleID == nil || pendingRule.id == ruleID,
+              model.mappings.rules.first(where: { $0.id == pendingRule.id }) != pendingRule else { return true }
+        do {
+            try model.automation.updateMapping(pendingRule)
+            self.pendingRule = nil
+            return true
+        } catch {
+            saveError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func revertPendingRule() {
+        pendingRule = nil
+        editorGeneration += 1
+    }
+
+    private func saveAndDismiss() {
+        if savePendingRule() { dismiss() }
+    }
+}
+
+struct MappingEditorDraft: Equatable {
+    var rule: MappingRule
+    var responseBodyText: String
+    var requestBodyText: String
+
+    init(rule: MappingRule) {
+        self.rule = rule
+        responseBodyText = rule.responseBody.formattedText
+        requestBodyText = rule.requestBody.formattedText
+    }
+
+    var preparedRule: MappingRule {
+        var result = rule
+        if result.responseBody.isText {
+            result.responseBody.data = Data(responseBodyText.utf8)
+        }
+        if result.requestBody.isText {
+            result.requestBody.data = Data(requestBodyText.utf8)
+        }
+        result.method = result.method.uppercased()
+        if !result.path.hasPrefix("/") { result.path = "/" + result.path }
+        return result
     }
 }
 
 private struct MappingEditorView: View {
-    @State private var draft: MappingRule
-    @State private var responseBodyText: String
-    @State private var requestBodyText: String
-    let onSave: (MappingRule) -> Void
+    @State private var editor: MappingEditorDraft
+    let onDraftChange: (MappingRule) -> Void
 
-    init(rule: MappingRule, onSave: @escaping (MappingRule) -> Void) {
-        _draft = State(initialValue: rule)
-        _responseBodyText = State(initialValue: rule.responseBody.formattedText)
-        _requestBodyText = State(initialValue: rule.requestBody.formattedText)
-        self.onSave = onSave
+    init(rule: MappingRule, onDraftChange: @escaping (MappingRule) -> Void) {
+        _editor = State(initialValue: MappingEditorDraft(rule: rule))
+        self.onDraftChange = onDraftChange
     }
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                TextField("Name", text: $draft.name)
-                Toggle("Enabled", isOn: $draft.enabled)
-                Picker("Behavior", selection: $draft.behavior) {
+                TextField("Name", text: $editor.rule.name)
+                Toggle("Enabled", isOn: $editor.rule.enabled)
+                Picker("Behavior", selection: $editor.rule.behavior) {
                     ForEach(MappingBehavior.allCases) { behavior in
                         Label(behavior.title, systemImage: behavior.systemImage).tag(behavior)
                     }
@@ -116,90 +194,70 @@ private struct MappingEditorView: View {
                 .pickerStyle(.segmented)
                 LabeledContent("Request") {
                     HStack {
-                        TextField("Method", text: $draft.method).frame(width: 80)
-                        TextField("Scheme", text: $draft.scheme).frame(width: 90)
-                        TextField("Host", text: $draft.host)
-                        TextField("Port", value: $draft.port, format: .number).frame(width: 70)
+                        TextField("Method", text: $editor.rule.method).frame(width: 80)
+                        TextField("Scheme", text: $editor.rule.scheme).frame(width: 90)
+                        TextField("Host", text: $editor.rule.host)
+                        TextField("Port", value: $editor.rule.port, format: .number).frame(width: 70)
                     }
                 }
-                TextField("Path", text: $draft.path)
-                Toggle("Match query parameters", isOn: $draft.matchQuery)
-                if draft.matchQuery {
-                    TextField("Query", text: Binding($draft.query, replacingNilWith: ""))
+                TextField("Path", text: $editor.rule.path)
+                Toggle("Match query parameters", isOn: $editor.rule.matchQuery)
+                if editor.rule.matchQuery {
+                    TextField("Query", text: Binding($editor.rule.query, replacingNilWith: ""))
                 }
-                if draft.behavior == .localResponse {
-                    TextField("Response status", value: $draft.statusCode, format: .number)
+                if editor.rule.behavior == .localResponse {
+                    TextField("Response status", value: $editor.rule.statusCode, format: .number)
                 } else {
-                    Toggle("Replace request headers", isOn: $draft.rewriteHeaders)
-                    Toggle("Replace request body", isOn: $draft.rewriteBody)
+                    Toggle("Replace request headers", isOn: $editor.rule.rewriteHeaders)
+                    Toggle("Replace request body", isOn: $editor.rule.rewriteBody)
                 }
             }
             .formStyle(.grouped)
             .frame(maxHeight: 300)
             Divider()
             HSplitView {
-                if draft.behavior == .localResponse {
+                if editor.rule.behavior == .localResponse {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Response headers").font(.headline)
-                        HeaderEditor(headers: $draft.responseHeaders, subject: "response")
+                        HeaderEditor(headers: $editor.rule.responseHeaders, subject: "response")
                     }
                     .padding(10)
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("Response body").font(.headline)
                             Spacer()
-                            Text(draft.responseBody.mimeType ?? "Unknown type").foregroundStyle(.secondary)
+                            Text(editor.rule.responseBody.mimeType ?? "Unknown type").foregroundStyle(.secondary)
                         }
-                        CodeTextView(text: $responseBodyText, isEditable: draft.responseBody.isText)
+                        CodeTextView(text: $editor.responseBodyText, isEditable: editor.rule.responseBody.isText)
+                            .accessibilityLabel("Response body")
                     }
                     .padding(10)
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Request headers").font(.headline)
-                        HeaderEditor(headers: $draft.requestHeaders, subject: "request")
-                            .disabled(!draft.rewriteHeaders)
+                        HeaderEditor(headers: $editor.rule.requestHeaders, subject: "request")
+                            .disabled(!editor.rule.rewriteHeaders)
                     }
                     .padding(10)
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("Request body").font(.headline)
                             Spacer()
-                            Text(draft.requestBody.mimeType ?? "Unknown type").foregroundStyle(.secondary)
+                            Text(editor.rule.requestBody.mimeType ?? "Unknown type").foregroundStyle(.secondary)
                         }
                         CodeTextView(
-                            text: $requestBodyText,
-                            isEditable: draft.rewriteBody && draft.requestBody.isText
+                            text: $editor.requestBodyText,
+                            isEditable: editor.rule.rewriteBody && editor.rule.requestBody.isText
                         )
+                        .accessibilityLabel("Request body")
                     }
                     .padding(10)
                 }
             }
-            Divider()
-            HStack {
-                Text(draft.matchSummary).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
-                Spacer()
-                Button("Revert") { resetBody() }
-                Button("Save") { save() }.keyboardShortcut(.defaultAction)
-            }
-            .padding(10)
         }
-    }
-
-    private func resetBody() {
-        responseBodyText = draft.responseBody.formattedText
-        requestBodyText = draft.requestBody.formattedText
-    }
-
-    private func save() {
-        if draft.responseBody.isText {
-            draft.responseBody.data = Data(responseBodyText.utf8)
+        .onChange(of: editor) { _, editor in
+            onDraftChange(editor.preparedRule)
         }
-        if draft.requestBody.isText {
-            draft.requestBody.data = Data(requestBodyText.utf8)
-        }
-        draft.method = draft.method.uppercased()
-        if !draft.path.hasPrefix("/") { draft.path = "/" + draft.path }
-        onSave(draft)
     }
 }
 

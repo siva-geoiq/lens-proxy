@@ -335,6 +335,48 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(secondStore.rules.first?.name, "New local response")
     }
 
+    func testMappingEditorDraftPersistsEditedResponseBodyExactly() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("mappings.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var rule = makeRule(path: "v1/config")
+        rule.method = "post"
+        rule.responseBody = BodyPayload(
+            data: Data(#"{"original":true}"#.utf8),
+            isText: true,
+            truncated: false,
+            mimeType: "application/json"
+        )
+        var draft = MappingEditorDraft(rule: rule)
+        draft.responseBodyText = #"{"edited":true,"message":"saved from the editor"}"#
+
+        let prepared = draft.preparedRule
+        let store = MappingStore(fileURL: fileURL)
+        store.add(rule)
+        store.update(prepared)
+        let reloaded = try XCTUnwrap(MappingStore(fileURL: fileURL).rules.first)
+
+        XCTAssertEqual(String(decoding: reloaded.responseBody.data, as: UTF8.self), draft.responseBodyText)
+        XCTAssertEqual(reloaded.method, "POST")
+        XCTAssertEqual(reloaded.path, "/v1/config")
+    }
+
+    func testMappingEditorDraftDoesNotReplaceBinaryBodyWithDisplayText() {
+        var rule = makeRule()
+        let binaryData = Data([0x00, 0x01, 0xfe, 0xff])
+        rule.responseBody = BodyPayload(
+            data: binaryData,
+            isText: false,
+            truncated: false,
+            mimeType: "application/octet-stream"
+        )
+        var draft = MappingEditorDraft(rule: rule)
+        draft.responseBodyText = "not the binary payload"
+
+        XCTAssertEqual(draft.preparedRule.responseBody.data, binaryData)
+    }
+
     func testJSONTreeValueRoundTripPreservesEditableTypes() throws {
         let source = Data(#"{"name":"Lens","count":2,"ratio":1.5,"enabled":true,"missing":null,"items":[1,"two"]}"#.utf8)
         let document = try JSONValue.decodeJSON(from: source)
