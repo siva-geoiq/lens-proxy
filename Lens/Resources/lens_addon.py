@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -15,6 +16,13 @@ MAX_BODY_BYTES = 10 * 1024 * 1024
 # 64 KiB default. Keep an explicit upper bound and report larger commands without
 # dropping the authenticated control connection.
 MAX_CONTROL_MESSAGE_BYTES = 64 * 1024 * 1024
+
+
+def path_matches(pattern, request_path):
+    if "*" not in pattern:
+        return pattern == request_path
+    expression = re.escape(pattern).replace(r"\*", ".*")
+    return re.fullmatch(expression, request_path) is not None
 
 
 class LensAddon:
@@ -190,7 +198,7 @@ class LensAddon:
                 continue
             if int(rule.get("port", request_port)) != request_port:
                 continue
-            if rule.get("path", "/") != split.path:
+            if not path_matches(rule.get("path", "/"), split.path):
                 continue
             if rule.get("matchQuery", False) and (rule.get("query") or "") != (split.query or ""):
                 continue
