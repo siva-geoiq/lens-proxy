@@ -37,6 +37,10 @@ Every JSON response contains `apiVersion`, `requestId`, and either `data` or `er
 | POST | `/v1/devices/{serial}/attach`, `/detach` | Change Android proxy attachment |
 | GET/PUT | `/v1/devices/{serial}/inspection` | Read or select inspection mode |
 | GET | `/v1/devices/{serial}/inspection/processes` | Debuggable processes |
+| GET | `/v1/devices/{serial}/shared-preferences/apps` | Apps accessible through Android `run-as` |
+| GET | `/v1/devices/{serial}/shared-preferences/{package}` | Preference files, typed entries, and package ETag |
+| GET | `/v1/devices/{serial}/shared-preferences/{package}/{file}` | One preference file with the package ETag |
+| POST | `/v1/devices/{serial}/shared-preferences/{package}/apply` | Atomically apply complete replacement entries for changed files |
 
 ## Flows and pagination
 
@@ -49,5 +53,7 @@ Read the mapping collection and retain its `ETag`. Send that value in `If-Match`
 ## Confirmations
 
 Destructive or disruptive calls can return HTTP 409 with `error.code` equal to `confirmation_required`. Show `error.details.summary` to the user. After approval, repeat the identical method, path, and body within 60 seconds using `--confirm error.details.confirmationId`.
+
+Shared Preferences apply requires both the package response `ETag` in `If-Match` and an `Idempotency-Key`. Values are typed as `string`, `stringSet`, `boolean`, `int`, `long`, or `float`; longs are decimal JSON strings so 64-bit values remain exact. Apply bodies contain complete replacement `entries` arrays only for changed existing files. A successful apply force-stops the app, atomically replaces the files, and attempts to relaunch its default activity. On HTTP 412, fetch the package again and rebuild the intended edits. Never print unrelated preference values or persist them to a repository.
 
 Do not reuse confirmation IDs or alter the payload between attempts.

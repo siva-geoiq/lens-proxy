@@ -18,7 +18,9 @@
       "ErrorEnvelope": {"type": "object", "required": ["apiVersion", "requestId", "error"], "properties": {"apiVersion": {"const": "1"}, "requestId": {"type": "string"}, "error": {"type": "object", "required": ["code", "message"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "details": {}}}}},
       "Operation": {"type": "object", "required": ["id", "state", "createdAt"], "properties": {"id": {"type": "string", "format": "uuid"}, "state": {"enum": ["pending", "running", "succeeded", "failed"]}, "createdAt": {"type": "number"}, "completedAt": {"type": ["number", "null"]}, "result": {}, "error": {}}},
       "PathInput": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
-      "InspectionInput": {"type": "object", "required": ["mode"], "properties": {"mode": {"enum": ["automatic", "package", "off"]}, "package": {"type": "string"}}}
+      "InspectionInput": {"type": "object", "required": ["mode"], "properties": {"mode": {"enum": ["automatic", "package", "off"]}, "package": {"type": "string"}}},
+      "SharedPreferenceEntry": {"type": "object", "required": ["key", "type", "value"], "properties": {"key": {"type": "string", "minLength": 1}, "type": {"enum": ["string", "stringSet", "boolean", "int", "long", "float"]}, "value": {"description": "A string, string array, boolean, integer, decimal-string long, or number matching type."}}},
+      "SharedPreferenceApplyInput": {"type": "object", "required": ["files"], "properties": {"files": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["fileName", "entries"], "properties": {"fileName": {"type": "string", "description": "An existing .xml basename without path separators or control characters."}, "entries": {"type": "array", "items": {"$ref": "#/components/schemas/SharedPreferenceEntry"}}}}}}}
     }
   },
   "paths": {
@@ -55,6 +57,10 @@
     "/v1/devices/{serial}/detach": {"post": {"operationId": "detachDevice", "responses": {"202": {"description": "Accepted"}}}},
     "/v1/devices/{serial}/inspection": {"get": {"operationId": "getInspection", "responses": {"200": {"description": "Inspection state"}}}, "put": {"operationId": "setInspection", "responses": {"200": {"description": "Updated"}}}},
     "/v1/devices/{serial}/inspection/processes": {"get": {"operationId": "listDebuggableProcesses", "responses": {"200": {"description": "Processes"}}}},
+    "/v1/devices/{serial}/shared-preferences/apps": {"get": {"operationId": "listSharedPreferenceApps", "responses": {"200": {"description": "Installed user apps accessible through run-as"}}}},
+    "/v1/devices/{serial}/shared-preferences/{package}": {"get": {"operationId": "getSharedPreferencePackage", "responses": {"200": {"description": "Preference files and package-wide ETag"}, "404": {"description": "Package is not debuggable"}}}},
+    "/v1/devices/{serial}/shared-preferences/{package}/{file}": {"get": {"operationId": "getSharedPreferenceFile", "responses": {"200": {"description": "Typed entries and package-wide ETag"}, "404": {"description": "File not found"}}}},
+    "/v1/devices/{serial}/shared-preferences/{package}/apply": {"post": {"operationId": "applySharedPreferences", "parameters": [{"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}}, {"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SharedPreferenceApplyInput"}}}}, "responses": {"202": {"description": "Apply operation accepted"}, "409": {"description": "Confirmation required"}, "412": {"description": "Preference revision changed"}, "428": {"description": "Required header missing"}}}},
     "/v1/operations/{operationId}": {"get": {"operationId": "getOperation", "responses": {"200": {"description": "Operation"}}}}
   }
 }

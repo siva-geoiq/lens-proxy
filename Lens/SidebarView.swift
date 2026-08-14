@@ -5,6 +5,7 @@ struct SidebarView: View {
     @State private var expandedDeviceIDs = Set<String>()
     @State private var hostSearchText = ""
     @State private var renamingDevice: DeviceTarget?
+    @State private var preferencesDevice: DeviceTarget?
 
     var body: some View {
         @Bindable var captures = model.captures
@@ -70,6 +71,9 @@ struct SidebarView: View {
         .sheet(item: $renamingDevice) { device in
             DeviceRenameView(device: device)
                 .frame(width: 430)
+        }
+        .sheet(item: $preferencesDevice) { device in
+            SharedPreferencesView(device: device)
         }
     }
 
@@ -157,6 +161,12 @@ struct SidebarView: View {
             }
 
             Divider()
+
+            Button {
+                preferencesDevice = device
+            } label: {
+                Label("Shared Preferences…", systemImage: "slider.horizontal.2.square")
+            }
 
             DeepInspectionMenu(device: device)
                 .disabled(!device.isAttached)

@@ -5,6 +5,7 @@ struct DeviceManagerView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var pendingVPNDevice: DeviceTarget?
     @State private var renamingDevice: DeviceTarget?
+    @State private var preferencesDevice: DeviceTarget?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -73,6 +74,9 @@ struct DeviceManagerView: View {
                                     }
                                 }
                                 Divider()
+                                Button("Shared Preferences…", systemImage: "slider.horizontal.2.square") {
+                                    preferencesDevice = device
+                                }
                                 DeepInspectionMenu(device: device)
                                     .disabled(!device.isAttached)
                             } label: {
@@ -149,6 +153,9 @@ struct DeviceManagerView: View {
         .sheet(item: $renamingDevice) { device in
             DeviceRenameView(device: device)
                 .frame(width: 430)
+        }
+        .sheet(item: $preferencesDevice) { device in
+            SharedPreferencesView(device: device)
         }
     }
 

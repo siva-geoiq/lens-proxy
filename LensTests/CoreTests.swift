@@ -4,6 +4,198 @@ import XCTest
 
 @MainActor
 final class CoreTests: XCTestCase {
+    func testSharedPreferencesCodecRoundTripsEveryAndroidTypeAndExactLong() throws {
+        let source = Data(#"""
+        <?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+        <map>
+            <string name="escaped">Lens &amp; Android &lt;debug&gt;</string>
+            <set name="empty"></set>
+            <set name="regions"><string>IN</string><string>SG</string></set>
+            <boolean name="enabled" value="true" />
+            <int name="attempts" value="-42" />
+            <long name="timestamp" value="9223372036854775807" />
+            <float name="ratio" value="1.25" />
+        </map>
+        """#.utf8)
+
+        let entries = try AndroidSharedPreferencesCodec.parse(source)
+        XCTAssertEqual(entries.first(where: { $0.key == "escaped" })?.value, .string("Lens & Android <debug>"))
+        XCTAssertEqual(entries.first(where: { $0.key == "empty" })?.value, .stringSet([]))
+        XCTAssertEqual(entries.first(where: { $0.key == "regions" })?.value, .stringSet(["IN", "SG"]))
+        XCTAssertEqual(entries.first(where: { $0.key == "enabled" })?.value, .boolean(true))
+        XCTAssertEqual(entries.first(where: { $0.key == "attempts" })?.value, .int(-42))
+        XCTAssertEqual(entries.first(where: { $0.key == "timestamp" })?.value, .long("9223372036854775807"))
+        XCTAssertEqual(entries.first(where: { $0.key == "ratio" })?.value, .float(1.25))
+
+        let serialized = try AndroidSharedPreferencesCodec.serialize(entries)
+        XCTAssertEqual(try AndroidSharedPreferencesCodec.parse(serialized), entries)
+        let json = try JSONEncoder().encode(entries.first(where: { $0.key == "timestamp" }))
+        XCTAssertTrue(String(decoding: json, as: UTF8.self).contains(#""9223372036854775807""#))
+    }
+
+    func testSharedPreferencesCodecRejectsMalformedDuplicateAndUnsupportedEntries() {
+        for xml in [
+            #"<map><string name="same">one</string><string name="same">two</string></map>"#,
+            #"<map><double name="unsupported" value="1.0" /></map>"#,
+            #"<not-map />"#
+        ] {
+            XCTAssertThrowsError(try AndroidSharedPreferencesCodec.parse(Data(xml.utf8)))
+        }
+        XCTAssertThrowsError(
+            try AndroidSharedPreferencesCodec.serialize([
+                AndroidPreferenceEntry(key: "too-large", type: .int, value: .int(Int(Int32.max) + 1))
+            ])
+        )
+        XCTAssertThrowsError(
+            try AndroidSharedPreferencesCodec.serialize([
+                AndroidPreferenceEntry(key: "mismatch", type: .boolean, value: .string("true"))
+            ])
+        )
+    }
+
+    func testSharedPreferencesRejectUnsafePackageAndFileIdentifiers() {
+        XCTAssertTrue(AndroidSharedPreferencesService.isValidPackage("com.example.debug"))
+        XCTAssertFalse(AndroidSharedPreferencesService.isValidPackage("single"))
+        XCTAssertFalse(AndroidSharedPreferencesService.isValidPackage("com.example;stop"))
+        XCTAssertFalse(AndroidSharedPreferencesService.isValidPackage("com.exämple.debug"))
+        XCTAssertTrue(AndroidSharedPreferencesService.isValidFileName("feature-flags_v2.xml"))
+        XCTAssertTrue(AndroidSharedPreferencesService.isValidFileName("WizRocket_ARP:TEST+debug.xml"))
+        XCTAssertFalse(AndroidSharedPreferencesService.isValidFileName("../settings.xml"))
+        XCTAssertFalse(AndroidSharedPreferencesService.isValidFileName("settings\n.xml"))
+    }
+
+    func testSharedPreferencesApplyUsesAtomicWriteAndRelaunches() async throws {
+        let original = #"<?xml version='1.0' encoding='utf-8' standalone='yes' ?><map><boolean name="enabled" value="false" /></map>"#
+        let updated = #"""
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <boolean name="enabled" value="true" />
+</map>
+"""#
+        let runner = FakeAndroidCommandRunner(responses: [
+            .success(), .success("settings.xml\0"), .success(original),
+            .success(),
+            .success("com.example.debug/.MainActivity\n"), .success(),
+            .success(), .success("settings.xml\0"), .success(original),
+            .success(), .success(), .success(),
+            .success(), .success("settings.xml\0"), .success(updated), .success()
+        ])
+        let service = try makeSharedPreferencesService(runner: runner)
+        let initial = try await service.loadPackage(deviceSerial: "emulator-5554", packageName: "com.example.debug")
+
+        let result = try await service.apply(
+            deviceSerial: "emulator-5554",
+            packageName: "com.example.debug",
+            expectedRevision: initial.revision,
+            replacements: [
+                AndroidPreferenceFileReplacement(
+                    fileName: "settings.xml",
+                    entries: [AndroidPreferenceEntry(key: "enabled", type: .boolean, value: .boolean(true))]
+                )
+            ]
+        )
+
+        XCTAssertTrue(result.relaunched)
+        XCTAssertEqual(result.changedFileCount, 1)
+        let calls = await runner.recordedCalls()
+        XCTAssertTrue(calls.contains { $0.arguments.contains("force-stop") })
+        XCTAssertTrue(calls.contains { $0.arguments.firstIndex(of: "exec-in") != nil && $0.input != nil })
+        XCTAssertTrue(calls.contains { $0.arguments.contains(where: { $0.contains("mv shared_prefs/settings.xml") }) })
+        XCTAssertTrue(calls.contains { $0.arguments.contains("com.example.debug/.MainActivity") })
+    }
+
+    func testSharedPreferencesApplyRollsBackAfterWriteFailure() async throws {
+        let original = #"<map><int name="count" value="1" /></map>"#
+        let runner = FakeAndroidCommandRunner(responses: [
+            .success(), .success("settings.xml\0"), .success(original)
+        ])
+        let service = try makeSharedPreferencesService(runner: runner)
+        let initial = try await service.loadPackage(deviceSerial: "emulator-5554", packageName: "com.example.debug")
+        await runner.append([
+            .success(),
+            .success("com.example.debug/.MainActivity\n"), .success(),
+            .success(), .success("settings.xml\0"), .success(original),
+            .success(),
+            CommandResult(output: "", errorOutput: "write failed", status: 1),
+            .success(), .success()
+        ])
+
+        do {
+            _ = try await service.apply(
+                deviceSerial: "emulator-5554",
+                packageName: "com.example.debug",
+                expectedRevision: initial.revision,
+                replacements: [
+                    AndroidPreferenceFileReplacement(
+                        fileName: "settings.xml",
+                        entries: [AndroidPreferenceEntry(key: "count", type: .int, value: .int(2))]
+                    )
+                ]
+            )
+            XCTFail("Expected apply to fail")
+        } catch let error as AndroidSharedPreferencesError {
+            guard case let .applyFailed(_, rollbackSucceeded) = error else {
+                return XCTFail("Expected applyFailed, got \(error)")
+            }
+            XCTAssertTrue(rollbackSucceeded)
+        }
+        let calls = await runner.recordedCalls()
+        XCTAssertTrue(calls.contains { $0.arguments.contains(where: { $0.contains("lens-backup") && $0.contains("mv") }) })
+    }
+
+    func testSharedPreferencesRejectsStaleRevisionBeforeWritingAndRelaunches() async throws {
+        let original = #"<map><boolean name="enabled" value="true" /></map>"#
+        let runner = FakeAndroidCommandRunner(responses: [
+            .success(), .success("com.example.debug/.MainActivity\n"), .success(),
+            .success(), .success("settings.xml\0"), .success(original), .success()
+        ])
+        let service = try makeSharedPreferencesService(runner: runner)
+        do {
+            _ = try await service.apply(
+                deviceSerial: "emulator-5554",
+                packageName: "com.example.debug",
+                expectedRevision: "stale",
+                replacements: [AndroidPreferenceFileReplacement(fileName: "settings.xml", entries: [])]
+            )
+            XCTFail("Expected stale revision")
+        } catch let error as AndroidSharedPreferencesError {
+            guard case .staleRevision = error else { return XCTFail("Expected staleRevision") }
+        }
+        let calls = await runner.recordedCalls()
+        XCTAssertTrue(calls.contains { $0.arguments.contains("force-stop") })
+        XCTAssertFalse(calls.contains { $0.arguments.contains("exec-in") })
+        XCTAssertTrue(calls.contains { $0.arguments.contains("com.example.debug/.MainActivity") })
+    }
+
+    func testSharedPreferencesRechecksRevisionAfterStoppingBeforeWriting() async throws {
+        let original = #"<map><boolean name="enabled" value="true" /></map>"#
+        let changed = #"<map><boolean name="enabled" value="false" /></map>"#
+        let runner = FakeAndroidCommandRunner(responses: [
+            .success(), .success("settings.xml\0"), .success(original),
+            .success(),
+            .success("com.example.debug/.MainActivity\n"), .success(),
+            .success(), .success("settings.xml\0"), .success(changed),
+            .success()
+        ])
+        let service = try makeSharedPreferencesService(runner: runner)
+        let initial = try await service.loadPackage(deviceSerial: "emulator-5554", packageName: "com.example.debug")
+        do {
+            _ = try await service.apply(
+                deviceSerial: "emulator-5554",
+                packageName: "com.example.debug",
+                expectedRevision: initial.revision,
+                replacements: [AndroidPreferenceFileReplacement(fileName: "settings.xml", entries: [])]
+            )
+            XCTFail("Expected stopped-state revision mismatch")
+        } catch let error as AndroidSharedPreferencesError {
+            guard case .staleRevision = error else { return XCTFail("Expected staleRevision") }
+        }
+        let calls = await runner.recordedCalls()
+        XCTAssertTrue(calls.contains { $0.arguments.contains("force-stop") })
+        XCTAssertFalse(calls.contains { $0.arguments.contains("exec-in") })
+        XCTAssertTrue(calls.contains { $0.arguments.contains("com.example.debug/.MainActivity") })
+    }
+
     func testADBDeviceParserPreservesWirelessSerialContainingSpaces() {
         let output = """
         List of devices attached
@@ -936,10 +1128,126 @@ final class CoreTests: XCTestCase {
         for path in [
             "/v1/status", "/v1/events", "/v1/engine/start", "/v1/capture/options",
             "/v1/flows", "/v1/search", "/v1/mappings", "/v1/sessions/save",
-            "/v1/devices", "/v1/devices/{serial}/inspection"
+            "/v1/devices", "/v1/devices/{serial}/inspection",
+            "/v1/devices/{serial}/shared-preferences/apps",
+            "/v1/devices/{serial}/shared-preferences/{package}",
+            "/v1/devices/{serial}/shared-preferences/{package}/{file}",
+            "/v1/devices/{serial}/shared-preferences/{package}/apply"
         ] {
             XCTAssertNotNil(paths[path], "OpenAPI is missing \(path)")
         }
+    }
+
+    func testSharedPreferencesAPIDiscoversAppsAndReturnsPackageETag() async throws {
+        let xml = #"<map><long name="exact" value="9223372036854775807" /></map>"#
+        let runner = FakeAndroidCommandRunner(responses: [
+            .success("com.example.debug\n"),
+            .success(), .success("settings.xml\0"), .success(xml)
+        ])
+        let fixture = try makeSharedPreferencesRouter(runner: runner)
+        let router = fixture.router
+        defer { withExtendedLifetime(fixture.model) {} }
+
+        let apps = await router.route(
+            LensHTTPRequest(
+                method: "GET",
+                target: "/v1/devices/emulator-5554/shared-preferences/apps",
+                path: "/v1/devices/emulator-5554/shared-preferences/apps",
+                query: [:], headers: [:], body: Data()
+            ),
+            requestID: "apps"
+        )
+        XCTAssertEqual(apps.status, 200)
+        XCTAssertTrue(String(decoding: apps.body, as: UTF8.self).contains("com.example.debug"))
+
+        let package = await router.route(
+            LensHTTPRequest(
+                method: "GET",
+                target: "/v1/devices/emulator-5554/shared-preferences/com.example.debug",
+                path: "/v1/devices/emulator-5554/shared-preferences/com.example.debug",
+                query: [:], headers: [:], body: Data()
+            ),
+            requestID: "package"
+        )
+        XCTAssertEqual(package.status, 200)
+        XCTAssertNotNil(package.headers["ETag"])
+        XCTAssertTrue(String(decoding: package.body, as: UTF8.self).contains(#""9223372036854775807""#))
+    }
+
+    func testSharedPreferencesAPIRequiresRevisionIdempotencyAndConfirmation() async throws {
+        let runner = FakeAndroidCommandRunner(responses: [
+            .success(), .success("settings.xml\0"), .success("<map></map>"),
+            .success(), .success("settings.xml\0"), .success("<map></map>")
+        ])
+        let fixture = try makeSharedPreferencesRouter(runner: runner)
+        let router = fixture.router
+        defer { withExtendedLifetime(fixture.model) {} }
+        let body = Data(#"{"files":[{"fileName":"settings.xml","entries":[]}]}"#.utf8)
+        let path = "/v1/devices/emulator-5554/shared-preferences/com.example.debug/apply"
+        let packagePath = "/v1/devices/emulator-5554/shared-preferences/com.example.debug"
+        let package = await router.route(
+            LensHTTPRequest(method: "GET", target: packagePath, path: packagePath, query: [:], headers: [:], body: Data()),
+            requestID: "package"
+        )
+        let revision = try XCTUnwrap(package.headers["ETag"])
+
+        var request = LensHTTPRequest(
+            method: "POST", target: path, path: path, query: [:], headers: [:], body: body
+        )
+        let missingRevision = await router.route(request, requestID: "revision")
+        XCTAssertEqual(missingRevision.status, 428)
+        XCTAssertTrue(String(decoding: missingRevision.body, as: UTF8.self).contains("precondition_required"))
+
+        request.headers["if-match"] = revision
+        let missingIdempotency = await router.route(request, requestID: "idempotency")
+        XCTAssertEqual(missingIdempotency.status, 428)
+        XCTAssertTrue(String(decoding: missingIdempotency.body, as: UTF8.self).contains("idempotency_key_required"))
+
+        request.headers["idempotency-key"] = "shared-prefs-test"
+        let confirmation = await router.route(request, requestID: "confirmation")
+        XCTAssertEqual(confirmation.status, 409)
+        XCTAssertTrue(String(decoding: confirmation.body, as: UTF8.self).contains("confirmation_required"))
+    }
+
+    private func makeSharedPreferencesService(
+        runner: any AndroidCommandRunning
+    ) throws -> AndroidSharedPreferencesService {
+        let bundle = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let adb = bundle.appendingPathComponent(LensRuntimePaths.bundledADBRelativePath)
+        try FileManager.default.createDirectory(at: adb.deletingLastPathComponent(), withIntermediateDirectories: true)
+        XCTAssertTrue(FileManager.default.createFile(atPath: adb.path, contents: Data()))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: adb.path)
+        return AndroidSharedPreferencesService(
+            runner: runner,
+            runtimePaths: LensRuntimePaths(
+                applicationBundleURL: bundle,
+                applicationSupportDirectory: bundle.appendingPathComponent("support")
+            )
+        )
+    }
+
+    private func makeSharedPreferencesRouter(
+        runner: any AndroidCommandRunning
+    ) throws -> (router: LensAPIRouter, model: LensModel) {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "LensTests.SharedPreferences.\(UUID().uuidString)"))
+        let devices = DeviceManager(defaults: defaults)
+        devices.prepareUITestDevices([
+            DeviceTarget(
+                serial: "emulator-5554",
+                model: "Pixel",
+                apiLevel: 35,
+                kind: .emulator,
+                rootState: .available,
+                isAttached: false,
+                previousProxy: nil,
+                caInstalled: false
+            )
+        ])
+        let model = LensModel(
+            devices: devices,
+            sharedPreferences: try makeSharedPreferencesService(runner: runner)
+        )
+        return (LensAPIRouter(controller: model.automation), model)
     }
 
     private func waitForSearch(_ store: CaptureStore, matching expectedIDs: [String]) async -> Bool {
@@ -1047,6 +1355,52 @@ final class CoreTests: XCTestCase {
             startedAt: 0, endedAt: 1, duration: 1, size: body.count,
             mappedRuleID: nil, mappedRuleName: nil, error: nil, websocketMessages: []
         )
+    }
+}
+
+private actor FakeAndroidCommandRunner: AndroidCommandRunning {
+    struct Call: Sendable {
+        var arguments: [String]
+        var input: Data?
+        var timeout: TimeInterval?
+    }
+
+    private var responses: [CommandResult]
+    private var calls: [Call] = []
+
+    init(responses: [CommandResult]) {
+        self.responses = responses
+    }
+
+    func run(
+        _ executable: URL,
+        arguments: [String],
+        input: Data?,
+        timeout: TimeInterval?
+    ) async throws -> CommandResult {
+        calls.append(Call(arguments: arguments, input: input, timeout: timeout))
+        guard !responses.isEmpty else {
+            return CommandResult(output: "", errorOutput: "Missing fake response", status: 1)
+        }
+        return responses.removeFirst()
+    }
+
+    func append(_ values: [CommandResult]) {
+        responses.append(contentsOf: values)
+    }
+
+    func prepend(_ values: [CommandResult]) {
+        responses.insert(contentsOf: values, at: 0)
+    }
+
+    func recordedCalls() -> [Call] {
+        calls
+    }
+}
+
+private extension CommandResult {
+    static func success(_ output: String = "") -> CommandResult {
+        CommandResult(output: output, errorOutput: "", status: 0)
     }
 }
 

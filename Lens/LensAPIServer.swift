@@ -227,6 +227,20 @@ final class LensAPIRouter {
             case .unavailable: 503
             }
             return .error(LensAPIProblem(status: status, code: "automation_error", message: error.localizedDescription), requestID: requestID)
+        } catch let error as AndroidSharedPreferencesError {
+            let response: LensAPIProblem = switch error {
+            case .staleRevision:
+                LensAPIProblem(status: 412, code: "revision_mismatch", message: error.localizedDescription)
+            case .adbMissing:
+                LensAPIProblem(status: 503, code: "shared_preferences_unavailable", message: error.localizedDescription)
+            case .packageNotDebuggable, .fileNotFound:
+                LensAPIProblem(status: 404, code: "shared_preferences_not_found", message: error.localizedDescription)
+            case .commandFailed, .applyFailed:
+                LensAPIProblem(status: 500, code: "shared_preferences_operation_failed", message: error.localizedDescription)
+            default:
+                LensAPIProblem(status: 400, code: "invalid_shared_preferences", message: error.localizedDescription)
+            }
+            return .error(response, requestID: requestID)
         } catch {
             return .error(LensAPIProblem(status: 500, code: "internal_error", message: error.localizedDescription), requestID: requestID)
         }
@@ -459,6 +473,70 @@ final class LensAPIRouter {
             let input = try decode(Input.self, request)
             try controller.setInspection(serial: serial, mode: input.mode, package: input.package)
             return .json(value: try JSONValue(controller.inspection(serial: serial)), requestID: requestID)
+        }
+        if request.method == "GET", components.count == 5,
+           components[3] == "shared-preferences", components[4] == "apps" {
+            return .json(
+                value: try JSONValue(["items": await controller.sharedPreferenceApps(serial: serial)]),
+                requestID: requestID
+            )
+        }
+        if request.method == "GET", components.count == 5, components[3] == "shared-preferences" {
+            let packageName = decodePath(components[4])
+            let snapshot = try await controller.sharedPreferencePackage(serial: serial, packageName: packageName)
+            return .json(
+                value: try JSONValue(snapshot),
+                requestID: requestID,
+                headers: ["ETag": "\"\(snapshot.revision)\""]
+            )
+        }
+        if request.method == "GET", components.count == 6, components[3] == "shared-preferences" {
+            let packageName = decodePath(components[4])
+            let fileName = decodePath(components[5])
+            let (file, revision) = try await controller.sharedPreferenceFile(
+                serial: serial,
+                packageName: packageName,
+                fileName: fileName
+            )
+            return .json(
+                value: try JSONValue(file),
+                requestID: requestID,
+                headers: ["ETag": "\"\(revision)\""]
+            )
+        }
+        if request.method == "POST", components.count == 6,
+           components[3] == "shared-preferences", components[5] == "apply" {
+            let packageName = decodePath(components[4])
+            guard let revisionHeader = request.header("if-match") else {
+                throw LensAPIProblem(status: 428, code: "precondition_required", message: "Supply the Shared Preferences ETag in If-Match.")
+            }
+            let revision = revisionHeader.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            guard request.header("idempotency-key")?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+                throw LensAPIProblem(status: 428, code: "idempotency_key_required", message: "Supply an Idempotency-Key for Shared Preferences apply operations.")
+            }
+            let input = try decode(AndroidPreferenceApplyRequest.self, request)
+            let current = try await controller.sharedPreferencePackage(serial: serial, packageName: packageName)
+            guard current.revision == revision else {
+                throw LensAPIProblem(
+                    status: 412,
+                    code: "revision_mismatch",
+                    message: "Shared Preferences changed; fetch the latest package and rebuild the intended edits."
+                )
+            }
+            try confirmations.authorize(
+                request: request,
+                summary: "Stop \(packageName), update \(input.files.count) Shared Preferences file(s), and relaunch it."
+            )
+            return operationResponse(request, requestID: requestID) { [controller] in
+                try JSONValue(
+                    await controller.applySharedPreferences(
+                        serial: serial,
+                        packageName: packageName,
+                        expectedRevision: revision,
+                        replacements: input.files
+                    )
+                )
+            }
         }
         throw LensAPIProblem.notFound("No device operation matches this request.")
     }

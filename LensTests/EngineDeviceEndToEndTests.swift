@@ -3,6 +3,72 @@ import XCTest
 
 @MainActor
 final class EngineDeviceEndToEndTests: XCTestCase {
+    func testSharedPreferencesReadEditRelaunchAndRestore() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        let markerURL = URL(fileURLWithPath: "/private/tmp/lens-run-shared-prefs-e2e")
+        guard environment["LENS_RUN_SHARED_PREFS_E2E"] == "1" || FileManager.default.fileExists(atPath: markerURL.path) else {
+            throw XCTSkip("Set LENS_RUN_SHARED_PREFS_E2E=1 or create /private/tmp/lens-run-shared-prefs-e2e to run the reversible Shared Preferences device test.")
+        }
+        let markerSerial = try? String(contentsOf: markerURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let serial = environment["LENS_E2E_DEVICE"] ?? markerSerial.flatMap { $0.isEmpty ? nil : $0 } ?? "emulator-5554"
+        let packageName = environment["LENS_E2E_PACKAGE"] ?? "com.lenskart.app"
+        let service = AndroidSharedPreferencesService()
+        let apps = try await service.discoverApps(deviceSerial: serial)
+        XCTAssertTrue(apps.contains(packageName))
+        let initial = try await service.loadPackage(deviceSerial: serial, packageName: packageName)
+        let preferredFile = initial.files.first(where: { $0.name == "godel.xml" && $0.isEditable })
+            ?? initial.files.first(where: \.isEditable)
+        let file = try XCTUnwrap(preferredFile)
+        let smokeKey = "__lens_shared_preferences_smoke_test__"
+        XCTAssertFalse(file.entries.contains { $0.key == smokeKey })
+        let modifiedEntries = file.entries + [
+            AndroidPreferenceEntry(key: smokeKey, type: .string, value: .string("verified"))
+        ]
+
+        do {
+            _ = try await service.apply(
+                deviceSerial: serial,
+                packageName: packageName,
+                expectedRevision: initial.revision,
+                replacements: [AndroidPreferenceFileReplacement(fileName: file.name, entries: modifiedEntries)]
+            )
+            let observed = try await service.loadPackage(deviceSerial: serial, packageName: packageName)
+            XCTAssertEqual(
+                observed.files.first(where: { $0.name == file.name })?.entries.first(where: { $0.key == smokeKey })?.value,
+                .string("verified")
+            )
+            _ = try await service.apply(
+                deviceSerial: serial,
+                packageName: packageName,
+                expectedRevision: observed.revision,
+                replacements: [AndroidPreferenceFileReplacement(fileName: file.name, entries: file.entries)]
+            )
+        } catch {
+            let originalError = error
+            for _ in 0..<3 {
+                guard let current = try? await service.loadPackage(deviceSerial: serial, packageName: packageName) else { continue }
+                guard current.files.first(where: { $0.name == file.name })?.entries.contains(where: { $0.key == smokeKey }) == true else {
+                    break
+                }
+                if (try? await service.apply(
+                    deviceSerial: serial,
+                    packageName: packageName,
+                    expectedRevision: current.revision,
+                    replacements: [AndroidPreferenceFileReplacement(fileName: file.name, entries: file.entries)]
+                )) != nil {
+                    break
+                }
+            }
+            throw originalError
+        }
+
+        let restored = try await service.loadPackage(deviceSerial: serial, packageName: packageName)
+        XCTAssertFalse(
+            restored.files.first(where: { $0.name == file.name })?.entries.contains(where: { $0.key == smokeKey }) == true
+        )
+    }
+
     func testAttachCaptureNoCachingAndExactEndpointMappings() async throws {
         let environment = ProcessInfo.processInfo.environment
         let markerURL = URL(fileURLWithPath: "/private/tmp/lens-run-device-e2e")
