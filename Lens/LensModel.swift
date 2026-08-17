@@ -23,6 +23,8 @@ final class LensModel {
     private var allowsAutomaticDeviceSync = true
     private var isPreparingDevices = false
     private var isAutoSyncingRememberedDevices = false
+    private var engineTransitionInProgress = false
+    private var attachmentTasks: [String: Task<Void, Error>] = [:]
 
     var engineState: EngineState = .stopped
     var engineLog = ""
@@ -87,8 +89,11 @@ final class LensModel {
         apiServer.start()
     }
 
-    func startEngine() {
-        allowsAutomaticDeviceSync = true
+    func startEngine(allowDuringTransition: Bool = false) {
+        guard allowDuringTransition || !engineTransitionInProgress else { return }
+        if !engineTransitionInProgress {
+            allowsAutomaticDeviceSync = true
+        }
         devices.startMonitoring()
         switch engineState {
         case .stopped, .failed:
@@ -108,7 +113,10 @@ final class LensModel {
                 logger.info("No Android devices found on discovery attempt \(attempt + 1); retrying")
                 try? await Task.sleep(for: .milliseconds(500))
             }
-            await devices.recoverPreviousAttachments()
+            let restoration = await devices.recoverPreviousAttachments()
+            if !restoration.isComplete {
+                self.lastError = "Lens could not restore stale Android proxy settings:\n\(restoration.failureSummary)"
+            }
             captures.attributeFlows(to: devices.devices)
             logger.info("Device preparation completed with \(self.devices.devices.count) connected device(s)")
             await autoAttachRememberedDevices(allowDuringPreparation: true)
@@ -128,9 +136,7 @@ final class LensModel {
                 onExit: { [weak self] status in
                     Task { @MainActor in
                         guard let self else { return }
-                        self.bridge.disconnect()
-                        if status == 0 { self.engineState = .stopped }
-                        else { self.engineState = .failed("mitmdump exited with status \(status).") }
+                        await self.handleUnexpectedEngineExit(status: status)
                     }
                 }
             )
@@ -189,7 +195,7 @@ final class LensModel {
         }
     }
 
-    func stopEngine() {
+    private func stopEngineImmediately() {
         allowsAutomaticDeviceSync = false
         bridge.send(type: "shutdown")
         engine.stop()
@@ -197,19 +203,16 @@ final class LensModel {
         engineState = .stopped
     }
 
-    func applyEngineSettings(proxyPort: Int) {
-        let shouldRestart = engine.isRunning && self.proxyPort != proxyPort
-        self.proxyPort = proxyPort
-        UserDefaults.standard.set(proxyPort, forKey: "proxyPort")
-        if shouldRestart {
-            stopEngine()
-            Task {
-                try? await Task.sleep(for: .milliseconds(300))
-                startEngine()
-            }
-        } else if !engine.isRunning {
+    func applyEngineSettings(proxyPort: Int) async throws {
+        guard self.proxyPort != proxyPort else { return }
+        if engine.isRunning {
+            try await transitionEngine(restartOn: proxyPort)
+        } else {
+            self.proxyPort = proxyPort
+            UserDefaults.standard.set(proxyPort, forKey: "proxyPort")
             engineState = .stopped
             startEngine()
+            try await waitForEngineReady()
         }
     }
 
@@ -308,6 +311,10 @@ final class LensModel {
 
     func attach(_ device: DeviceTarget, stopConflictingVPN: Bool = false) {
         guard attachingDeviceID == nil else { return }
+        guard !engineTransitionInProgress else {
+            lastError = "Wait for the current Lens engine transition to finish before attaching a device."
+            return
+        }
         guard case .running = engineState else {
             lastError = "Wait for the Lens proxy engine to finish starting before attaching a device."
             return
@@ -327,17 +334,18 @@ final class LensModel {
         }
     }
 
-    func shutdown() async {
+    func shutdown() async throws {
+        try await transitionEngine(restartOn: nil)
         apiServer.stop()
-        allowsAutomaticDeviceSync = false
         devicePreparationTask?.cancel()
         devices.stopMonitoring()
         await inspector.stop()
-        await devices.restoreAttachedDevicesAndWait()
-        stopEngine()
     }
 
     func attachForAutomation(serial: String, stopConflictingVPN: Bool = false) async throws {
+        guard !engineTransitionInProgress else {
+            throw LensAutomationError.conflict("The Lens proxy engine is stopping or restarting.")
+        }
         guard attachingDeviceID == nil else {
             throw LensAutomationError.conflict("Another device attachment is already in progress.")
         }
@@ -347,10 +355,16 @@ final class LensModel {
         guard let device = devices.devices.first(where: { $0.serial == serial }) else {
             throw LensAutomationError.notFound("Device \(serial) was not found.")
         }
-        attachingDeviceID = serial
-        defer { attachingDeviceID = nil }
-        try await devices.attach(device, proxyPort: proxyPort, stopConflictingVPN: stopConflictingVPN)
+        try await runTrackedAttachment(device, stopConflictingVPN: stopConflictingVPN)
         captures.attributeFlows(to: devices.devices)
+    }
+
+    func stopEngineSafely() async throws {
+        try await transitionEngine(restartOn: nil)
+    }
+
+    func restartEngineSafely() async throws {
+        try await transitionEngine(restartOn: proxyPort)
     }
 
 #if DEBUG
@@ -376,18 +390,20 @@ final class LensModel {
             switch envelope.type {
             case "hello":
                 guard envelope.protocolVersion == 2 else {
-                    engineState = .failed("Lens bridge protocol \(envelope.protocolVersion) is incompatible with this app.")
-                    bridge.disconnect()
-                    engine.stop()
+                    Task {
+                        await failRunningEngine(
+                            message: "Lens bridge protocol \(envelope.protocolVersion) is incompatible with this app."
+                        )
+                    }
                     return
                 }
                 if let payload = envelope.payload,
                    case let .object(object) = payload,
                    case let .string(version) = object["mitmproxyVersion"],
                    version.split(separator: ".").first != "12" {
-                    engineState = .failed("Lens requires mitmproxy 12.x; found \(version).")
-                    bridge.disconnect()
-                    engine.stop()
+                    Task {
+                        await failRunningEngine(message: "Lens requires mitmproxy 12.x; found \(version).")
+                    }
                 }
             case "authenticated":
                 engineState = .running(port: proxyPort)
@@ -456,6 +472,7 @@ final class LensModel {
 
     private func autoAttachRememberedDevices(allowDuringPreparation: Bool = false) async {
         guard allowsAutomaticDeviceSync else { return }
+        guard !engineTransitionInProgress else { return }
         guard allowDuringPreparation || !isPreparingDevices else { return }
         guard engineCanAcceptDeviceTraffic else {
             logger.notice("Skipping auto-attach because the proxy engine is unavailable")
@@ -485,10 +502,8 @@ final class LensModel {
     }
 
     private func attachDevice(_ device: DeviceTarget, stopConflictingVPN: Bool = false) async {
-        attachingDeviceID = device.serial
-        defer { attachingDeviceID = nil }
         do {
-            try await devices.attach(device, proxyPort: proxyPort, stopConflictingVPN: stopConflictingVPN)
+            try await runTrackedAttachment(device, stopConflictingVPN: stopConflictingVPN)
             captures.attributeFlows(to: devices.devices)
             logger.info("Attached \(device.serial, privacy: .public) to proxy port \(self.proxyPort)")
         } catch {
@@ -497,8 +512,161 @@ final class LensModel {
         }
     }
 
+    private func runTrackedAttachment(
+        _ device: DeviceTarget,
+        stopConflictingVPN: Bool = false,
+        allowDuringTransition: Bool = false
+    ) async throws {
+        guard allowDuringTransition || !engineTransitionInProgress else {
+            throw LensAutomationError.conflict("The Lens proxy engine is stopping or restarting.")
+        }
+        guard attachmentTasks[device.serial] == nil else {
+            throw LensAutomationError.conflict("Device \(device.serial) is already being attached.")
+        }
+        attachingDeviceID = device.serial
+        let port = proxyPort
+        let task = Task { @MainActor [devices] in
+            try await devices.attach(device, proxyPort: port, stopConflictingVPN: stopConflictingVPN)
+        }
+        attachmentTasks[device.serial] = task
+        defer {
+            attachmentTasks.removeValue(forKey: device.serial)
+            if attachingDeviceID == device.serial {
+                attachingDeviceID = nil
+            }
+        }
+        try await task.value
+    }
+
+    private func transitionEngine(restartOn restartPort: Int?) async throws {
+        // Lifecycle requests are serialized on the main actor. A Quit arriving
+        // while crash cleanup is finishing must wait for that cleanup instead of
+        // being rejected and presenting a misleading restoration-failure alert.
+        while engineTransitionInProgress {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        engineTransitionInProgress = true
+        allowsAutomaticDeviceSync = false
+        defer { engineTransitionInProgress = false }
+
+        await cancelAndDrainAttachments()
+        await devices.refresh()
+        let reattachIDs = devices.devices.filter(\.isAttached).map(\.aliasKey)
+        let restoration = await devices.restoreAttachedDevicesAndWait()
+        guard restoration.isComplete else {
+            allowsAutomaticDeviceSync = true
+            throw LensEngineTransitionError.proxyRestorationFailed(restoration)
+        }
+
+        stopEngineImmediately()
+        guard let restartPort else { return }
+
+        proxyPort = restartPort
+        UserDefaults.standard.set(restartPort, forKey: "proxyPort")
+        startEngine(allowDuringTransition: true)
+        try await waitForEngineReady()
+        await refreshDevices(autoAttachRememberedDevice: false)
+
+        var reattachmentFailures: [ProxyRestorationFailure] = []
+        for identifier in reattachIDs {
+            guard let target = devices.devices.first(where: { $0.aliasKey == identifier }) else {
+                reattachmentFailures.append(
+                    ProxyRestorationFailure(serial: identifier, message: "The device is no longer connected.")
+                )
+                continue
+            }
+            do {
+                try await runTrackedAttachment(target, allowDuringTransition: true)
+            } catch {
+                reattachmentFailures.append(
+                    ProxyRestorationFailure(serial: target.serial, message: error.localizedDescription)
+                )
+            }
+        }
+        guard reattachmentFailures.isEmpty else {
+            allowsAutomaticDeviceSync = false
+            throw LensEngineTransitionError.reattachmentFailed(reattachmentFailures)
+        }
+        allowsAutomaticDeviceSync = true
+    }
+
+    private func waitForEngineReady() async throws {
+        for _ in 0..<200 {
+            switch engineState {
+            case .running:
+                return
+            case let .failed(message):
+                throw LensEngineTransitionError.engineStartFailed(message)
+            case .starting, .stopped:
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw LensEngineTransitionError.engineStartFailed("Timed out waiting for mitmproxy authentication.")
+    }
+
+    private func cancelAndDrainAttachments() async {
+        let runningTasks = Array(attachmentTasks.values)
+        runningTasks.forEach { $0.cancel() }
+        for task in runningTasks {
+            _ = try? await task.value
+        }
+    }
+
+    private func handleUnexpectedEngineExit(status: Int32) async {
+        bridge.disconnect()
+        let message = status == 0
+            ? "The Lens proxy engine exited unexpectedly."
+            : "mitmdump exited with status \(status)."
+        await restoreAfterEngineFailure(message: message, stopRunningEngine: false)
+    }
+
+    private func failRunningEngine(message: String) async {
+        await restoreAfterEngineFailure(message: message, stopRunningEngine: true)
+    }
+
+    private func restoreAfterEngineFailure(message: String, stopRunningEngine: Bool) async {
+        guard !engineTransitionInProgress else {
+            engineState = .failed(message)
+            return
+        }
+        engineTransitionInProgress = true
+        allowsAutomaticDeviceSync = false
+        defer { engineTransitionInProgress = false }
+        await cancelAndDrainAttachments()
+        await devices.refresh()
+        let restoration = await devices.restoreAttachedDevicesAndWait()
+        if stopRunningEngine, restoration.isComplete {
+            stopEngineImmediately()
+        }
+        let cleanupMessage = restoration.isComplete
+            ? message
+            : "\(message) Lens could not restore Android proxy settings:\n\(restoration.failureSummary)"
+        engineState = .failed(cleanupMessage)
+        lastError = cleanupMessage
+    }
+
     private func appendLog(_ line: String) {
         engineLog += line + "\n"
         if engineLog.count > 20_000 { engineLog.removeFirst(engineLog.count - 20_000) }
+    }
+}
+
+enum LensEngineTransitionError: LocalizedError {
+    case proxyRestorationFailed(ProxyRestorationReport)
+    case engineStartFailed(String)
+    case reattachmentFailed([ProxyRestorationFailure])
+
+    var errorDescription: String? {
+        switch self {
+        case let .proxyRestorationFailed(report):
+            "Lens could not restore Android proxy settings:\n\(report.failureSummary)"
+        case let .engineStartFailed(message):
+            "Lens could not restart the proxy engine: \(message)"
+        case let .reattachmentFailed(failures):
+            "Lens restarted, but these devices were left on direct networking:\n" +
+                failures.map { "\($0.serial): \($0.message)" }.joined(separator: "\n")
+        }
     }
 }

@@ -1023,6 +1023,184 @@ final class CoreTests: XCTestCase {
         XCTAssertNil(preferences.lastEmulatorSerial)
     }
 
+    func testDetachClearsAndroidInMemoryProxyWithColonZero() async throws {
+        let runner = FakeAndroidCommandRunner(responses: [.success(), .success(), .success()])
+        let fixture = try makeProxyDeviceManager(runner: runner)
+        defer { fixture.cleanup() }
+        let device = makeProxyDevice(attached: true, previousProxy: nil)
+        fixture.manager.prepareUITestDevices([device])
+
+        try await fixture.manager.detach(device, forgetRememberedDevice: false)
+
+        let calls = await runner.recordedCalls().map(\.arguments)
+        XCTAssertTrue(calls.contains { $0.suffix(5) == ["settings", "put", "global", "http_proxy", ":0"] })
+        XCTAssertTrue(calls.contains { $0.suffix(4) == ["settings", "delete", "global", "global_http_proxy_host"] })
+        XCTAssertTrue(calls.contains { $0.suffix(4) == ["settings", "delete", "global", "global_http_proxy_port"] })
+        XCTAssertFalse(try XCTUnwrap(fixture.manager.devices.first).isAttached)
+    }
+
+    func testDetachRestoresPreviousProxyExactly() async throws {
+        let runner = FakeAndroidCommandRunner(responses: [.success(), .success(), .success()])
+        let fixture = try makeProxyDeviceManager(runner: runner)
+        defer { fixture.cleanup() }
+        let previous = ProxySnapshot(host: "proxy.example", port: 8888)
+        let device = makeProxyDevice(attached: true, previousProxy: previous)
+        fixture.manager.prepareUITestDevices([device])
+
+        try await fixture.manager.detach(device, forgetRememberedDevice: false)
+
+        let calls = await runner.recordedCalls().map(\.arguments)
+        XCTAssertTrue(calls.contains { $0.suffix(5) == ["settings", "put", "global", "http_proxy", "proxy.example:8888"] })
+        XCTAssertTrue(calls.contains { $0.suffix(5) == ["settings", "put", "global", "global_http_proxy_host", "proxy.example"] })
+        XCTAssertTrue(calls.contains { $0.suffix(5) == ["settings", "put", "global", "global_http_proxy_port", "8888"] })
+    }
+
+    func testProxyRestorationFailureIsReportedAndSnapshotIsRetained() async throws {
+        let runner = FakeAndroidCommandRunner(responses: [.failure("device offline")])
+        let snapshot = ProxySnapshot(host: nil, port: nil)
+        let fixture = try makeProxyDeviceManager(
+            runner: runner,
+            snapshots: ["emulator-5554": snapshot]
+        )
+        defer { fixture.cleanup() }
+        fixture.manager.prepareUITestDevices([makeProxyDevice(attached: true, previousProxy: snapshot)])
+
+        let report = await fixture.manager.restoreAttachedDevicesAndWait()
+
+        XCTAssertEqual(report.failures.map(\.serial), ["emulator-5554"])
+        let data = try XCTUnwrap(fixture.defaults.data(forKey: "attachedProxySnapshots"))
+        let retained = try JSONDecoder().decode([String: ProxySnapshot].self, from: data)
+        XCTAssertNotNil(retained["emulator-5554"])
+        XCTAssertTrue(try XCTUnwrap(fixture.manager.devices.first).isAttached)
+    }
+
+    func testAttachmentFailureAfterProxyMutationRollsBackAndClearsSnapshot() async throws {
+        let runner = FakeAndroidCommandRunner(responses: [
+            .success("null\n"),
+            .success("restarting adbd as root\n"),
+            .success(),
+            .success("2000\n"),
+            .success(), .success(), .success(),
+            .failure("activity launch failed"),
+            .success(), .success(), .success()
+        ])
+        let fixture = try makeProxyDeviceManager(runner: runner)
+        defer { fixture.cleanup() }
+        let device = makeProxyDevice(attached: false, previousProxy: nil)
+        fixture.manager.prepareUITestDevices([device])
+
+        do {
+            try await fixture.manager.attach(device, proxyPort: 8080)
+            XCTFail("Expected attachment to fail")
+        } catch {
+            // The assertion is the rollback state below.
+        }
+
+        let calls = await runner.recordedCalls().map(\.arguments)
+        XCTAssertTrue(calls.contains { $0.suffix(5) == ["settings", "put", "global", "http_proxy", "10.0.2.2:8080"] })
+        XCTAssertTrue(calls.contains { $0.suffix(5) == ["settings", "put", "global", "http_proxy", ":0"] })
+        let data = try XCTUnwrap(fixture.defaults.data(forKey: "attachedProxySnapshots"))
+        XCTAssertTrue(try JSONDecoder().decode([String: ProxySnapshot].self, from: data).isEmpty)
+        XCTAssertFalse(try XCTUnwrap(fixture.manager.devices.first).isAttached)
+    }
+
+    func testTimedOutFirstProxyWriteStillAttemptsRollback() async throws {
+        let runner = FakeAndroidCommandRunner(responses: [
+            .success("null\n"),
+            .success("restarting adbd as root\n"),
+            .success(),
+            .success("2000\n"),
+            .failure("proxy write timed out after reaching Android"),
+            .success(), .success(), .success()
+        ])
+        let fixture = try makeProxyDeviceManager(runner: runner)
+        defer { fixture.cleanup() }
+        let device = makeProxyDevice(attached: false, previousProxy: nil)
+        fixture.manager.prepareUITestDevices([device])
+
+        do {
+            try await fixture.manager.attach(device, proxyPort: 8080)
+            XCTFail("Expected attachment to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("proxy write timed out"))
+        }
+
+        let calls = await runner.recordedCalls().map(\.arguments)
+        XCTAssertTrue(calls.contains { $0.suffix(5) == ["settings", "put", "global", "http_proxy", ":0"] })
+        let data = try XCTUnwrap(fixture.defaults.data(forKey: "attachedProxySnapshots"))
+        XCTAssertTrue(try JSONDecoder().decode([String: ProxySnapshot].self, from: data).isEmpty)
+    }
+
+    func testRepeatedAttachmentDoesNotOverwriteOriginalProxySnapshot() async throws {
+        let runner = FakeAndroidCommandRunner(responses: [])
+        let original = ProxySnapshot(host: "proxy.example", port: 8888)
+        let fixture = try makeProxyDeviceManager(
+            runner: runner,
+            snapshots: ["emulator-5554": original]
+        )
+        defer { fixture.cleanup() }
+        let device = makeProxyDevice(attached: true, previousProxy: original)
+        fixture.manager.prepareUITestDevices([device])
+
+        do {
+            try await fixture.manager.attach(device, proxyPort: 18081)
+            XCTFail("Expected repeated attachment to be rejected")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("already attached"))
+        }
+
+        let recordedCalls = await runner.recordedCalls()
+        XCTAssertTrue(recordedCalls.isEmpty)
+        let data = try XCTUnwrap(fixture.defaults.data(forKey: "attachedProxySnapshots"))
+        XCTAssertEqual(
+            try JSONDecoder().decode([String: ProxySnapshot].self, from: data)["emulator-5554"],
+            original
+        )
+    }
+
+    func testEngineStopRestoresProxyBeforeChangingStateToStopped() async throws {
+        let runner = FakeAndroidCommandRunner(responses: proxyRefreshResponses() + [
+            .success(), .success(), .success()
+        ])
+        let fixture = try makeProxyDeviceManager(
+            runner: runner,
+            snapshots: ["emulator-5554": ProxySnapshot(host: nil, port: nil)]
+        )
+        defer { fixture.cleanup() }
+        let model = LensModel(devices: fixture.manager)
+        model.engineState = .running(port: 8080)
+
+        try await model.stopEngineSafely()
+
+        XCTAssertEqual(model.engineState, .stopped)
+        let calls = await runner.recordedCalls().map(\.arguments)
+        XCTAssertTrue(calls.contains { $0.suffix(5) == ["settings", "put", "global", "http_proxy", ":0"] })
+    }
+
+    func testEngineStopFailureKeepsRunningStateAndRecoverySnapshot() async throws {
+        let runner = FakeAndroidCommandRunner(responses: proxyRefreshResponses() + [
+            .failure("device offline")
+        ])
+        let fixture = try makeProxyDeviceManager(
+            runner: runner,
+            snapshots: ["emulator-5554": ProxySnapshot(host: nil, port: nil)]
+        )
+        defer { fixture.cleanup() }
+        let model = LensModel(devices: fixture.manager)
+        model.engineState = .running(port: 8080)
+
+        do {
+            try await model.stopEngineSafely()
+            XCTFail("Expected proxy restoration to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("device offline"))
+        }
+
+        XCTAssertEqual(model.engineState, .running(port: 8080))
+        let data = try XCTUnwrap(fixture.defaults.data(forKey: "attachedProxySnapshots"))
+        XCTAssertNotNil(try JSONDecoder().decode([String: ProxySnapshot].self, from: data)["emulator-5554"])
+    }
+
     func testRememberedPhysicalDeviceIsAutoSyncCandidateAcrossWirelessTransports() throws {
         let suiteName = "LensTests.RememberedPhysicalDevice.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -1205,6 +1383,55 @@ final class CoreTests: XCTestCase {
         ] {
             XCTAssertNotNil(paths[path], "OpenAPI is missing \(path)")
         }
+        let settings = try XCTUnwrap(paths["/v1/settings"] as? [String: Any])
+        let patch = try XCTUnwrap(settings["patch"] as? [String: Any])
+        let responses = try XCTUnwrap(patch["responses"] as? [String: Any])
+        XCTAssertNotNil(responses["202"])
+        XCTAssertNotNil(responses["409"])
+    }
+
+    func testSettingsPatchReturnsPollableOperation() async throws {
+        let model = LensModel()
+        let router = LensAPIRouter(controller: model.automation)
+        let body = try JSONSerialization.data(withJSONObject: ["proxyPort": model.proxyPort])
+        let path = "/v1/settings"
+
+        let accepted = await router.route(
+            LensHTTPRequest(method: "PATCH", target: path, path: path, query: [:], headers: [:], body: body),
+            requestID: "settings"
+        )
+
+        XCTAssertEqual(accepted.status, 202)
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: accepted.body) as? [String: Any])
+        let data = try XCTUnwrap(envelope["data"] as? [String: Any])
+        let operationID = try XCTUnwrap(data["id"] as? String)
+        try await Task.sleep(for: .milliseconds(20))
+        let operationPath = "/v1/operations/\(operationID)"
+        let completed = await router.route(
+            LensHTTPRequest(method: "GET", target: operationPath, path: operationPath, query: [:], headers: [:], body: Data()),
+            requestID: "operation"
+        )
+        XCTAssertEqual(completed.status, 200)
+        XCTAssertTrue(String(decoding: completed.body, as: UTF8.self).contains(#""state":"succeeded""#))
+    }
+
+    func testSettingsPatchRequiresConfirmationForAttachedDevices() async throws {
+        let runner = FakeAndroidCommandRunner(responses: [])
+        let fixture = try makeProxyDeviceManager(runner: runner)
+        defer { fixture.cleanup() }
+        fixture.manager.prepareUITestDevices([makeProxyDevice(attached: true, previousProxy: nil)])
+        let model = LensModel(devices: fixture.manager)
+        let router = LensAPIRouter(controller: model.automation)
+        let body = try JSONSerialization.data(withJSONObject: ["proxyPort": model.proxyPort + 1])
+        let path = "/v1/settings"
+
+        let response = await router.route(
+            LensHTTPRequest(method: "PATCH", target: path, path: path, query: [:], headers: [:], body: body),
+            requestID: "settings-confirmation"
+        )
+
+        XCTAssertEqual(response.status, 409)
+        XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("confirmation_required"))
     }
 
     func testSharedPreferencesAPIDiscoversAppsAndReturnsPackageETag() async throws {
@@ -1356,6 +1583,65 @@ final class CoreTests: XCTestCase {
         )
     }
 
+    private func makeProxyDeviceManager(
+        runner: any AndroidCommandRunning,
+        snapshots: [String: ProxySnapshot] = [:]
+    ) throws -> (
+        manager: DeviceManager,
+        defaults: UserDefaults,
+        cleanup: () -> Void
+    ) {
+        let suiteName = "LensTests.ProxyLifecycle.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        if !snapshots.isEmpty {
+            defaults.set(try JSONEncoder().encode(snapshots), forKey: "attachedProxySnapshots")
+        }
+        let bundle = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let adb = bundle.appendingPathComponent(LensRuntimePaths.bundledADBRelativePath)
+        try FileManager.default.createDirectory(at: adb.deletingLastPathComponent(), withIntermediateDirectories: true)
+        XCTAssertTrue(FileManager.default.createFile(atPath: adb.path, contents: Data()))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: adb.path)
+        let paths = LensRuntimePaths(
+            applicationBundleURL: bundle,
+            applicationSupportDirectory: bundle.appendingPathComponent("support")
+        )
+        return (
+            DeviceManager(defaults: defaults, runtimePaths: paths, runner: runner),
+            defaults,
+            {
+                defaults.removePersistentDomain(forName: suiteName)
+                try? FileManager.default.removeItem(at: bundle)
+            }
+        )
+    }
+
+    private func makeProxyDevice(attached: Bool, previousProxy: ProxySnapshot?) -> DeviceTarget {
+        DeviceTarget(
+            serial: "emulator-5554",
+            model: "Pixel",
+            apiLevel: 35,
+            kind: .emulator,
+            rootState: .unavailable,
+            isAttached: attached,
+            previousProxy: previousProxy,
+            caInstalled: false,
+            networkAddresses: ["10.0.2.15"]
+        )
+    }
+
+    private func proxyRefreshResponses() -> [CommandResult] {
+        [
+            .success("List of devices attached\nemulator-5554\tdevice product:sdk model:Pixel\n"),
+            .success("Pixel\n"),
+            .success("35\n"),
+            .success("2000\n"),
+            .success("emulator-5554\n"),
+            .success("1: wlan0 inet 10.0.2.15/24 scope global wlan0\n"),
+            .success()
+        ]
+    }
+
     private func framed(_ payload: Data) -> Data {
         var data = Data([
             UInt8((payload.count >> 24) & 0xff),
@@ -1470,6 +1756,10 @@ private actor FakeAndroidCommandRunner: AndroidCommandRunning {
 private extension CommandResult {
     static func success(_ output: String = "") -> CommandResult {
         CommandResult(output: output, errorOutput: "", status: 0)
+    }
+
+    static func failure(_ message: String) -> CommandResult {
+        CommandResult(output: "", errorOutput: message, status: 1)
     }
 }
 

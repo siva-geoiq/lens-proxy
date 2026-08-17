@@ -263,17 +263,28 @@ final class LensAPIRouter {
         }
         if request.method == "POST", components == ["v1", "engine", "stop"] {
             if controller.hasAttachedDevices { try confirmations.authorize(request: request, summary: "Stop Lens and restore all attached device proxies.") }
-            return operationResponse(request, requestID: requestID) { [controller] in await controller.stopEngine(); return try controller.status() }
+            return operationResponse(request, requestID: requestID) { [controller] in try await controller.stopEngine(); return try controller.status() }
         }
         if request.method == "POST", components == ["v1", "engine", "restart"] {
             if controller.hasAttachedDevices { try confirmations.authorize(request: request, summary: "Restart Lens while Android devices are attached.") }
-            return operationResponse(request, requestID: requestID) { [controller] in await controller.restartEngine(); return try controller.status() }
+            return operationResponse(request, requestID: requestID) { [controller] in try await controller.restartEngine(); return try controller.status() }
         }
         if request.method == "PATCH", components == ["v1", "settings"] {
             struct Input: Decodable { var proxyPort: Int? }
             let input = try decode(Input.self, request)
-            if let port = input.proxyPort { try controller.setProxyPort(port) }
-            return .json(value: try controller.status(), requestID: requestID)
+            guard let port = input.proxyPort else {
+                throw LensAutomationError.invalidInput("proxyPort is required.")
+            }
+            if controller.hasAttachedDevices {
+                try confirmations.authorize(
+                    request: request,
+                    summary: "Change the Lens proxy port and safely reattach all Android devices."
+                )
+            }
+            return operationResponse(request, requestID: requestID) { [controller] in
+                try await controller.setProxyPort(port)
+                return try controller.status()
+            }
         }
         if request.method == "POST", components == ["v1", "capture", "pause"] {
             controller.setCapturePaused(true)

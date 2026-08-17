@@ -120,7 +120,7 @@ final class DeviceManager {
     var adbPath: String? { runtimePaths.bundledADBURL()?.path }
     var onDevicesChanged: (([DeviceTarget]) -> Void)?
 
-    private let runner = CommandRunner()
+    private let runner: any AndroidCommandRunning
     private let preferences: DeviceAttachmentPreferences
     private let defaults: UserDefaults
     private let runtimePaths: LensRuntimePaths
@@ -134,9 +134,14 @@ final class DeviceManager {
     private var monitoringEnabled = false
     private var refreshPending = false
 
-    init(defaults: UserDefaults = .standard, runtimePaths: LensRuntimePaths = .live()) {
+    init(
+        defaults: UserDefaults = .standard,
+        runtimePaths: LensRuntimePaths = .live(),
+        runner: any AndroidCommandRunning = CommandRunner()
+    ) {
         self.defaults = defaults
         self.runtimePaths = runtimePaths
+        self.runner = runner
         preferences = DeviceAttachmentPreferences(defaults: defaults)
         loadSnapshots()
         migrateAttachmentSnapshotsToRememberedDevices()
@@ -333,6 +338,11 @@ final class DeviceManager {
     }
 
     func attach(_ target: DeviceTarget, proxyPort: Int, stopConflictingVPN: Bool = false) async throws {
+        guard !target.isAttached,
+              attachedSnapshots[target.aliasKey] == nil,
+              attachedSnapshots[target.serial] == nil else {
+            throw DeviceManagerError.alreadyAttached(target.serial)
+        }
         if let activeVPNPackage, !activeVPNPackage.isEmpty {
             guard stopConflictingVPN else { throw DeviceManagerError.vpnConflict(activeVPNPackage) }
             _ = try await shell(target.serial, ["am", "force-stop", activeVPNPackage])
@@ -345,38 +355,92 @@ final class DeviceManager {
         }
         persistSnapshots()
 
-        var rootAvailable = target.rootState == .available
-        if target.kind == .emulator && !rootAvailable {
-            let root = try await adb(["-s", target.serial, "root"])
-            if root.status == 0 {
-                _ = try await adb(["-s", target.serial, "wait-for-device"])
-                rootAvailable = try await shell(target.serial, ["id", "-u"]).output.trimmingCharacters(in: .whitespacesAndNewlines) == "0"
+        var proxyMutationStarted = false
+        do {
+            try Task.checkCancellation()
+            var rootAvailable = target.rootState == .available
+            if target.kind == .emulator && !rootAvailable {
+                let root = try await adb(["-s", target.serial, "root"], timeout: 10)
+                if root.status == 0 {
+                    _ = try await adb(["-s", target.serial, "wait-for-device"], timeout: 10)
+                    rootAvailable = try await shell(
+                        target.serial,
+                        ["id", "-u"],
+                        timeout: Self.proxyCommandTimeout
+                    ).output.trimmingCharacters(in: .whitespacesAndNewlines) == "0"
+                }
             }
-        }
 
-        if rootAvailable {
-            try await waitForCertificate()
-            try await installCA(on: target)
-        }
+            try Task.checkCancellation()
+            if rootAvailable {
+                try await waitForCertificate()
+                try await installCA(on: target)
+            }
 
-        let proxyHost = target.kind == .emulator ? "10.0.2.2" : try localIPAddress()
-        _ = try await shell(target.serial, ["settings", "put", "global", "http_proxy", "\(proxyHost):\(proxyPort)"])
-        _ = try await shell(target.serial, ["settings", "put", "global", "global_http_proxy_host", proxyHost])
-        _ = try await shell(target.serial, ["settings", "put", "global", "global_http_proxy_port", String(proxyPort)])
+            try Task.checkCancellation()
+            let proxyHost = target.kind == .emulator ? "10.0.2.2" : try localIPAddress()
+            // A timed-out ADB command may have reached Android even when it did not
+            // return a result, so treat the first proxy write as a mutation attempt.
+            proxyMutationStarted = true
+            _ = try await shell(
+                target.serial,
+                ["settings", "put", "global", "http_proxy", "\(proxyHost):\(proxyPort)"],
+                timeout: Self.proxyCommandTimeout
+            )
+            _ = try await shell(
+                target.serial,
+                ["settings", "put", "global", "global_http_proxy_host", proxyHost],
+                timeout: Self.proxyCommandTimeout
+            )
+            _ = try await shell(
+                target.serial,
+                ["settings", "put", "global", "global_http_proxy_port", String(proxyPort)],
+                timeout: Self.proxyCommandTimeout
+            )
 
-        if !rootAvailable {
-            _ = try await shell(target.serial, ["am", "start", "-a", "android.intent.action.VIEW", "-d", "http://mitm.it"])
-        }
+            try Task.checkCancellation()
+            if !rootAvailable {
+                _ = try await shell(
+                    target.serial,
+                    ["am", "start", "-a", "android.intent.action.VIEW", "-d", "http://mitm.it"],
+                    timeout: 10
+                )
+            }
 
-        updateDevice(target.serial) {
-            $0.isAttached = true
-            $0.previousProxy = snapshot
-            $0.rootState = rootAvailable ? .available : .unavailable
-            $0.caInstalled = rootAvailable
-        }
-        preferences.remember(deviceID: target.aliasKey)
-        if target.kind == .emulator {
-            preferences.remember(emulatorSerial: target.serial)
+            updateDevice(target.serial) {
+                $0.isAttached = true
+                $0.previousProxy = snapshot
+                $0.rootState = rootAvailable ? .available : .unavailable
+                $0.caInstalled = rootAvailable
+            }
+            preferences.remember(deviceID: target.aliasKey)
+            if target.kind == .emulator {
+                preferences.remember(emulatorSerial: target.serial)
+            }
+        } catch {
+            if proxyMutationStarted {
+                do {
+                    try await restoreProxySettings(for: target, snapshot: snapshot)
+                } catch let rollbackError {
+                    updateDevice(target.serial) {
+                        $0.isAttached = true
+                        $0.previousProxy = snapshot
+                    }
+                    throw DeviceManagerError.attachmentRollbackFailed(
+                        original: error.localizedDescription,
+                        rollback: rollbackError.localizedDescription
+                    )
+                }
+            }
+            attachedSnapshots.removeValue(forKey: target.aliasKey)
+            attachedSnapshots.removeValue(forKey: target.serial)
+            persistSnapshots()
+            updateDevice(target.serial) {
+                $0.isAttached = false
+                $0.previousProxy = nil
+                $0.caInstalled = false
+            }
+            throw error
         }
     }
 
@@ -385,15 +449,7 @@ final class DeviceManager {
             preferences.forget(deviceID: target.aliasKey, transportID: target.serial)
         }
         let snapshot = attachedSnapshots[target.aliasKey] ?? attachedSnapshots[target.serial] ?? target.previousProxy
-        if let host = snapshot?.host, let port = snapshot?.port {
-            _ = try await shell(target.serial, ["settings", "put", "global", "http_proxy", "\(host):\(port)"])
-            _ = try await shell(target.serial, ["settings", "put", "global", "global_http_proxy_host", host])
-            _ = try await shell(target.serial, ["settings", "put", "global", "global_http_proxy_port", String(port)])
-        } else {
-            _ = try await shell(target.serial, ["settings", "put", "global", "http_proxy", ":0"])
-            _ = try await shell(target.serial, ["settings", "delete", "global", "global_http_proxy_host"])
-            _ = try await shell(target.serial, ["settings", "delete", "global", "global_http_proxy_port"])
-        }
+        try await restoreProxySettings(for: target, snapshot: snapshot)
         try? await removeCA(from: target)
         attachedSnapshots.removeValue(forKey: target.aliasKey)
         attachedSnapshots.removeValue(forKey: target.serial)
@@ -409,16 +465,28 @@ final class DeviceManager {
         Task { await restoreAttachedDevicesAndWait() }
     }
 
-    func restoreAttachedDevicesAndWait() async {
-        for target in devices.filter(\.isAttached) {
-            try? await detach(target, forgetRememberedDevice: false)
+    func restoreAttachedDevicesAndWait() async -> ProxyRestorationReport {
+        var report = ProxyRestorationReport()
+        let targets = devices.filter { target in
+            target.isAttached || attachedSnapshots[target.aliasKey] != nil || attachedSnapshots[target.serial] != nil
         }
+        for target in targets {
+            do {
+                try await detach(target, forgetRememberedDevice: false)
+                report.restoredSerials.append(target.serial)
+            } catch {
+                report.failures.append(
+                    ProxyRestorationFailure(serial: target.serial, message: error.localizedDescription)
+                )
+            }
+        }
+        return report
     }
 
-    func recoverPreviousAttachments() async {
-        guard !attachedSnapshots.isEmpty else { return }
+    func recoverPreviousAttachments() async -> ProxyRestorationReport {
+        guard !attachedSnapshots.isEmpty else { return ProxyRestorationReport() }
         await refresh()
-        await restoreAttachedDevicesAndWait()
+        return await restoreAttachedDevicesAndWait()
     }
 
     func prepareUITestDevices(_ fixtures: [DeviceTarget]) {
@@ -426,7 +494,11 @@ final class DeviceManager {
     }
 
     private func readProxy(_ serial: String) async throws -> ProxySnapshot {
-        let output = try await shell(serial, ["settings", "get", "global", "http_proxy"])
+        let output = try await shell(
+            serial,
+            ["settings", "get", "global", "http_proxy"],
+            timeout: Self.proxyCommandTimeout
+        )
             .output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !output.isEmpty, output != "null", output != ":0",
               let separator = output.lastIndex(of: ":"),
@@ -436,6 +508,42 @@ final class DeviceManager {
         return ProxySnapshot(host: String(output[..<separator]), port: port)
     }
 
+    private func restoreProxySettings(for target: DeviceTarget, snapshot: ProxySnapshot?) async throws {
+        if let host = snapshot?.host, let port = snapshot?.port {
+            _ = try await shell(
+                target.serial,
+                ["settings", "put", "global", "http_proxy", "\(host):\(port)"],
+                timeout: Self.proxyCommandTimeout
+            )
+            _ = try await shell(
+                target.serial,
+                ["settings", "put", "global", "global_http_proxy_host", host],
+                timeout: Self.proxyCommandTimeout
+            )
+            _ = try await shell(
+                target.serial,
+                ["settings", "put", "global", "global_http_proxy_port", String(port)],
+                timeout: Self.proxyCommandTimeout
+            )
+        } else {
+            _ = try await shell(
+                target.serial,
+                ["settings", "put", "global", "http_proxy", ":0"],
+                timeout: Self.proxyCommandTimeout
+            )
+            _ = try await shell(
+                target.serial,
+                ["settings", "delete", "global", "global_http_proxy_host"],
+                timeout: Self.proxyCommandTimeout
+            )
+            _ = try await shell(
+                target.serial,
+                ["settings", "delete", "global", "global_http_proxy_port"],
+                timeout: Self.proxyCommandTimeout
+            )
+        }
+    }
+
     private func installCA(on target: DeviceTarget) async throws {
         let certificate = runtimePaths.certificateURL
         guard FileManager.default.fileExists(atPath: certificate.path) else {
@@ -443,7 +551,9 @@ final class DeviceManager {
         }
         let hashResult = try await runner.run(
             URL(fileURLWithPath: "/usr/bin/openssl"),
-            arguments: ["x509", "-inform", "PEM", "-subject_hash_old", "-in", certificate.path, "-noout"]
+            arguments: ["x509", "-inform", "PEM", "-subject_hash_old", "-in", certificate.path, "-noout"],
+            input: nil,
+            timeout: 5
         )
         let hash = hashResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !hash.isEmpty else { throw DeviceManagerError.certificateHashFailed }
@@ -506,7 +616,9 @@ final class DeviceManager {
         guard FileManager.default.fileExists(atPath: certificate.path) else { return }
         let hash = try await runner.run(
             URL(fileURLWithPath: "/usr/bin/openssl"),
-            arguments: ["x509", "-inform", "PEM", "-subject_hash_old", "-in", certificate.path, "-noout"]
+            arguments: ["x509", "-inform", "PEM", "-subject_hash_old", "-in", certificate.path, "-noout"],
+            input: nil,
+            timeout: 5
         ).output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !hash.isEmpty else { return }
         _ = try? await shell(target.serial, ["rm", "-f", "/system/etc/security/cacerts/\(hash).0"])
@@ -652,7 +764,7 @@ final class DeviceManager {
 
     private func adb(_ arguments: [String], timeout: TimeInterval? = nil) async throws -> CommandResult {
         guard let adbURL = runtimePaths.bundledADBURL() else { throw DeviceManagerError.adbNotFound }
-        let result = try await runner.run(adbURL, arguments: arguments, timeout: timeout)
+        let result = try await runner.run(adbURL, arguments: arguments, input: nil, timeout: timeout)
         if result.status != 0 {
             throw DeviceManagerError.commandFailed(result.errorOutput.isEmpty ? result.output : result.errorOutput)
         }
@@ -743,6 +855,24 @@ final class DeviceManager {
     private func persistDeviceAliases() {
         defaults.set(try? JSONEncoder().encode(deviceAliases), forKey: "deviceAliases")
     }
+
+    private static let proxyCommandTimeout: TimeInterval = 5
+}
+
+struct ProxyRestorationFailure: Hashable, Sendable {
+    var serial: String
+    var message: String
+}
+
+struct ProxyRestorationReport: Hashable, Sendable {
+    var restoredSerials: [String] = []
+    var failures: [ProxyRestorationFailure] = []
+
+    var isComplete: Bool { failures.isEmpty }
+
+    var failureSummary: String {
+        failures.map { "\($0.serial): \($0.message)" }.joined(separator: "\n")
+    }
 }
 
 enum CommandRunnerError: LocalizedError {
@@ -763,6 +893,8 @@ enum DeviceManagerError: LocalizedError {
     case certificateHashFailed
     case localAddressUnavailable
     case vpnConflict(String)
+    case alreadyAttached(String)
+    case attachmentRollbackFailed(original: String, rollback: String)
 
     var errorDescription: String? {
         switch self {
@@ -772,6 +904,9 @@ enum DeviceManagerError: LocalizedError {
         case .certificateHashFailed: "Could not calculate the mitmproxy CA certificate hash."
         case .localAddressUnavailable: "No reachable Mac LAN address was found for the physical device."
         case let .vpnConflict(package): "A device VPN is active (\(package)). Confirm stopping it before attaching Lens."
+        case let .alreadyAttached(serial): "Device \(serial) is already attached to Lens."
+        case let .attachmentRollbackFailed(original, rollback):
+            "Attachment failed (\(original)) and Lens could not restore the previous Android proxy (\(rollback))."
         }
     }
 }

@@ -257,24 +257,21 @@ final class LensAutomationController {
         publish(type: "engine.command", payload: .object(["command": .string("start")]))
     }
 
-    func stopEngine() async {
-        await model.devices.restoreAttachedDevicesAndWait()
-        model.stopEngine()
+    func stopEngine() async throws {
+        try await model.stopEngineSafely()
         publish(type: "engine.command", payload: .object(["command": .string("stop")]))
     }
 
-    func restartEngine() async {
-        model.stopEngine()
-        try? await Task.sleep(for: .milliseconds(300))
-        model.startEngine()
+    func restartEngine() async throws {
+        try await model.restartEngineSafely()
         publish(type: "engine.command", payload: .object(["command": .string("restart")]))
     }
 
-    func setProxyPort(_ port: Int) throws {
+    func setProxyPort(_ port: Int) async throws {
         guard (1...65_535).contains(port) else {
             throw LensAutomationError.invalidInput("Proxy port must be between 1 and 65535.")
         }
-        model.applyEngineSettings(proxyPort: port)
+        try await model.applyEngineSettings(proxyPort: port)
         publish(type: "settings.updated", payload: .object(["proxyPort": .number(Double(port))]))
     }
 

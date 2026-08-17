@@ -11,14 +11,40 @@ import SwiftUI
 @MainActor
 final class LensApplicationDelegate: NSObject, NSApplicationDelegate {
     weak var model: LensModel?
+    private var quitWithoutCleanup = false
+    private var terminationTask: Task<Void, Never>?
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if quitWithoutCleanup { return .terminateNow }
         guard let model else { return .terminateNow }
-        Task {
-            await model.shutdown()
-            sender.reply(toApplicationShouldTerminate: true)
+        guard terminationTask == nil else { return .terminateLater }
+        terminationTask = Task {
+            do {
+                try await model.shutdown()
+                terminationTask = nil
+                sender.reply(toApplicationShouldTerminate: true)
+            } catch {
+                terminationTask = nil
+                sender.reply(toApplicationShouldTerminate: false)
+                presentCleanupFailure(error, sender: sender)
+            }
         }
         return .terminateLater
+    }
+
+    private func presentCleanupFailure(_ error: Error, sender: NSApplication) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Lens could not restore Android proxy settings"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "Retry Cleanup")
+        alert.addButton(withTitle: "Quit Anyway")
+        if alert.runModal() == .alertFirstButtonReturn {
+            sender.terminate(nil)
+        } else {
+            quitWithoutCleanup = true
+            sender.terminate(nil)
+        }
     }
 }
 

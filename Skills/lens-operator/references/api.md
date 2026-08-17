@@ -16,7 +16,7 @@ Every JSON response contains `apiVersion`, `requestId`, and either `data` or `er
 | GET | `/v1/events` | SSE stream; reconnect with `Last-Event-ID` |
 | POST | `/v1/engine/start`, `/stop`, `/restart` | Engine lifecycle |
 | GET | `/v1/engine/log` | Recent bundled mitmproxy log |
-| PATCH | `/v1/settings` | Set `proxyPort` |
+| PATCH | `/v1/settings` | Set `proxyPort` through a pollable engine transition |
 | POST | `/v1/capture/pause`, `/resume`, `/clear` | Capture lifecycle |
 | PUT | `/v1/capture/options` | Set `removeConditionalHeaders` |
 | GET | `/v1/flows` | Paginated flow metadata |
@@ -53,6 +53,8 @@ Read the mapping collection and retain its `ETag`. Send that value in `If-Match`
 ## Confirmations
 
 Destructive or disruptive calls can return HTTP 409 with `error.code` equal to `confirmation_required`. Show `error.details.summary` to the user. After approval, repeat the identical method, path, and body within 60 seconds using `--confirm error.details.confirmationId`.
+
+Changing `proxyPort` while Android devices are attached requires confirmation and returns HTTP 202. Poll the returned operation until it succeeds or fails; success means Lens restored the devices, restarted and authenticated mitmproxy on the new port, and reattached the devices. A failed operation leaves successfully restored devices on direct networking and preserves recovery snapshots for devices Lens could not restore.
 
 Shared Preferences apply requires both the package response `ETag` in `If-Match` and an `Idempotency-Key`. Values are typed as `string`, `stringSet`, `boolean`, `int`, `long`, or `float`; longs are decimal JSON strings so 64-bit values remain exact. Apply bodies contain complete replacement `entries` arrays only for changed existing files. A successful apply force-stops the app, atomically replaces the files, and attempts to relaunch its default activity. On HTTP 412, fetch the package again and rebuild the intended edits. Never print unrelated preference values or persist them to a repository.
 

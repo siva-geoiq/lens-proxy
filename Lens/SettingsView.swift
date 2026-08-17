@@ -66,8 +66,10 @@ struct SettingsView: View {
     }
 
     private func apply() {
-        do { try model.automation.setProxyPort(proxyPort) }
-        catch { model.lastError = error.localizedDescription }
+        Task {
+            do { try await model.automation.setProxyPort(proxyPort) }
+            catch { model.lastError = error.localizedDescription }
+        }
     }
 
     private var apiStatus: String {

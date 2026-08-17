@@ -8,6 +8,8 @@
 4. Poll its operation until `succeeded`, trigger the app request, then filter `/v1/flows` by `deviceId` and host.
 5. Detach the device at the end only if this workflow attached it.
 
+Stopping Lens restores every attached device proxy before stopping mitmproxy. Restarting or changing `proxyPort` restores devices first, waits for the new engine to authenticate, then reattaches them. Treat these calls as incomplete until their operation succeeds. If cleanup fails, Lens keeps a still-running engine alive when possible and returns the affected device serials in the operation error.
+
 If attachment reports a VPN conflict, do not immediately retry with `stopConflictingVPN`. Ask the user, send `{"stopConflictingVPN":true}`, show the confirmation summary, and only then repeat with its confirmation ID.
 
 ## Mock a response

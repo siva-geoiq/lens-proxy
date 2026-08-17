@@ -32,7 +32,7 @@
     "/v1/engine/start": {"post": {"operationId": "startEngine", "responses": {"202": {"description": "Operation accepted"}}}},
     "/v1/engine/stop": {"post": {"operationId": "stopEngine", "responses": {"202": {"description": "Operation accepted"}, "409": {"description": "Confirmation required"}}}},
     "/v1/engine/restart": {"post": {"operationId": "restartEngine", "responses": {"202": {"description": "Operation accepted"}, "409": {"description": "Confirmation required"}}}},
-    "/v1/settings": {"patch": {"operationId": "updateSettings", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"proxyPort": {"type": "integer", "minimum": 1, "maximum": 65535}}}}}}, "responses": {"200": {"description": "Updated"}}}},
+    "/v1/settings": {"patch": {"operationId": "updateSettings", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["proxyPort"], "properties": {"proxyPort": {"type": "integer", "minimum": 1, "maximum": 65535}}}}}}, "responses": {"202": {"description": "Accepted; poll the returned operation"}, "409": {"description": "Confirmation required while devices are attached"}}}},
     "/v1/capture/pause": {"post": {"operationId": "pauseCapture", "responses": {"200": {"description": "Paused"}}}},
     "/v1/capture/resume": {"post": {"operationId": "resumeCapture", "responses": {"200": {"description": "Resumed"}}}},
     "/v1/capture/clear": {"post": {"operationId": "clearCapture", "responses": {"200": {"description": "Cleared"}, "409": {"description": "Confirmation required"}}}},
