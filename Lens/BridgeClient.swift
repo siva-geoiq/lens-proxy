@@ -7,9 +7,13 @@ struct JSONLineFramer {
     mutating func append(_ data: Data) -> [Data] {
         buffer.append(data)
         var lines: [Data] = []
+        // Counts, not indices: a `Data` subsequence does not start at zero, so mixing
+        // an index returned by `firstIndex` with a slice of a different origin can read
+        // out of bounds. Re-wrapping keeps the buffer's index space at zero each round.
         while let newlineIndex = buffer.firstIndex(of: 0x0A) {
-            let line = Data(buffer[..<newlineIndex])
-            buffer.removeSubrange(...newlineIndex)
+            let lineLength = buffer.distance(from: buffer.startIndex, to: newlineIndex)
+            let line = Data(buffer.prefix(lineLength))
+            buffer = Data(buffer.dropFirst(lineLength + 1))
             if !line.isEmpty { lines.append(line) }
         }
         return lines
@@ -25,23 +29,38 @@ final class BridgeClient: @unchecked Sendable {
     var onEnvelope: (@Sendable (BridgeEnvelope) -> Void)?
     var onStateChange: (@Sendable (NWConnection.State) -> Void)?
 
+    /// Connects on the bridge queue.
+    ///
+    /// `connect` and `disconnect` are called from the main actor and from the engine's
+    /// output reader, while `consume` runs on this queue. Every access to `connection`,
+    /// `token` and `framer` therefore happens on `queue`; touching the framer from two
+    /// threads corrupts its buffer and crashes on the next read.
     func connect(port: UInt16, token: String) {
-        disconnect()
-        self.token = token
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return }
-        let connection = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
-        self.connection = connection
-        connection.stateUpdateHandler = { [weak self] state in
-            self?.onStateChange?(state)
-            if case .ready = state {
-                self?.send(type: "authenticate", payload: ["token": token])
-                self?.receiveNext()
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.teardown()
+            self.token = token
+            let connection = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            self.connection = connection
+            connection.stateUpdateHandler = { [weak self] state in
+                self?.onStateChange?(state)
+                if case .ready = state {
+                    self?.send(type: "authenticate", payload: ["token": token])
+                    // Already on `queue`: NWConnection reports state there.
+                    self?.receiveNext()
+                }
             }
+            connection.start(queue: self.queue)
         }
-        connection.start(queue: queue)
     }
 
     func disconnect() {
+        queue.async { [weak self] in self?.teardown() }
+    }
+
+    /// Must run on `queue`.
+    private func teardown() {
         connection?.cancel()
         connection = nil
         framer = JSONLineFramer()
