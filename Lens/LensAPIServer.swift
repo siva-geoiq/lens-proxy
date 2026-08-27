@@ -448,6 +448,17 @@ final class LensAPIRouter {
 
     private func deviceRoute(_ request: LensHTTPRequest, components: [String], requestID: String) async throws -> LensHTTPResponse {
         let serial = decodePath(components[2])
+        // Shared Preferences and Deep Inspection both work by shelling into ADB, so they
+        // do not exist for an iOS target. Say so instead of failing inside ADB.
+        if components.count >= 4, ["inspection", "shared-preferences"].contains(components[3]),
+           let device = try? controller.device(serial: serial), device.platform != .android {
+            throw LensAPIProblem(
+                status: 409,
+                code: "android_only",
+                message: "\(components[3]) is available for Android devices only; \(serial) runs \(device.platform.displayName).",
+                details: .object(["platform": .string(device.platform.rawValue)])
+            )
+        }
         if request.method == "GET", components.count == 3 {
             return .json(value: try JSONValue(controller.device(serial: serial)), requestID: requestID)
         }
@@ -459,7 +470,8 @@ final class LensAPIRouter {
         if request.method == "POST", components.count == 4, components[3] == "attach" {
             struct Input: Decodable { var stopConflictingVPN: Bool? }
             let stopVPN = (try? decode(Input.self, request).stopConflictingVPN) ?? false
-            if !stopVPN, let package = controller.activeVPNPackage {
+            let isAndroid = (try? controller.device(serial: serial))?.platform == .android
+            if isAndroid, !stopVPN, let package = controller.activeVPNPackage {
                 throw LensAPIProblem(
                     status: 409,
                     code: "vpn_conflict",

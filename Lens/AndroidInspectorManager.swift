@@ -61,7 +61,10 @@ final class AndroidInspectorManager {
         self.correlator = correlator
     }
 
-    func updateDevices(_ devices: [DeviceTarget]) {
+    func updateDevices(_ allDevices: [DeviceTarget]) {
+        // Deep Inspection drives an ADB agent, so an iOS target would poll a serial that
+        // ADB has never heard of every two seconds.
+        let devices = allDevices.filter(\.supportsAndroidTooling)
         devicesByID = Dictionary(uniqueKeysWithValues: devices.map { ($0.serial, $0) })
         let activeIDs = Set(devices.filter(\.isAttached).map(\.serial))
         for id in monitorTasks.keys where !activeIDs.contains(id) {

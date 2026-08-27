@@ -74,6 +74,13 @@ final class LensModel {
                 payload: (try? JSONValue(rules)) ?? .array([])
             )
         }
+        captures.simulatorUDIDResolver = { [weak self] port in
+            self?.devices.simulatorUDIDByClientPort[port]
+        }
+        devices.onSimulatorAttributionChanged = { [weak self] in
+            guard let self else { return }
+            self.captures.attributeFlows(to: self.devices.devices)
+        }
         devices.onDevicesChanged = { [weak self] devices in
             guard let self else { return }
             self.captures.attributeFlows(to: devices)
@@ -334,6 +341,14 @@ final class LensModel {
         }
     }
 
+    /// Boots a shut-down simulator so it can be attached.
+    func bootSimulator(udid: String) {
+        Task {
+            do { try await devices.bootSimulator(udid: udid) }
+            catch { lastError = error.localizedDescription }
+        }
+    }
+
     func shutdown() async throws {
         try await transitionEngine(restartOn: nil)
         apiServer.stop()
@@ -412,7 +427,13 @@ final class LensModel {
                 Task { await autoAttachRememberedDevices() }
             case "flowUpsert":
                 guard let payload = envelope.payload else { return }
-                var flow = captures.attributed(try payload.decode(FlowRecord.self), to: devices.devices)
+                let decodedFlow = try payload.decode(FlowRecord.self)
+                var flow = captures.attributed(decodedFlow, to: devices.devices)
+                if flow.deviceID == nil {
+                    // A manually configured iPhone announces itself by its first request.
+                    devices.bindGuidedDeviceIfNeeded(clientAddress: decodedFlow.clientAddress)
+                    flow = captures.attributed(decodedFlow, to: devices.devices)
+                }
                 if flow.androidContext == nil, let context = inspector.context(for: flow) {
                     flow.androidContext = context
                     bridge.send(

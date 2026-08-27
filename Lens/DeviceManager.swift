@@ -21,7 +21,8 @@ private final class CommandOutputBuffer: @unchecked Sendable {
     }
 }
 
-protocol AndroidCommandRunning: Sendable {
+/// Runs an external command line tool. Implemented by `CommandRunner` and faked in tests.
+protocol CommandRunning: Sendable {
     func run(
         _ executable: URL,
         arguments: [String],
@@ -109,7 +110,10 @@ final class CommandRunner: @unchecked Sendable {
     }
 }
 
-extension CommandRunner: AndroidCommandRunning {}
+extension CommandRunner: CommandRunning {}
+
+/// Retained so existing Android call sites keep reading naturally.
+typealias AndroidCommandRunning = CommandRunning
 
 @MainActor
 @Observable
@@ -119,11 +123,30 @@ final class DeviceManager {
     private(set) var activeVPNPackage: String?
     var adbPath: String? { runtimePaths.bundledADBURL()?.path }
     var onDevicesChanged: (([DeviceTarget]) -> Void)?
+    /// Fires when simulator socket ownership changes, so captured flows can be
+    /// re-attributed without a full device refresh.
+    var onSimulatorAttributionChanged: (() -> Void)?
+
+    /// Loopback client port to simulator UDID, mirrored from the attribution actor so
+    /// main-actor flow attribution can read it synchronously.
+    private(set) var simulatorUDIDByClientPort: [Int: String] = [:]
+
+    /// Every available simulator, including shut-down ones, so the UI can offer to boot
+    /// one. Only booted simulators appear in `devices`.
+    private(set) var availableSimulators: [SimulatorDevice] = []
+
+    /// Nil when Xcode is not installed, which is the only reason iOS discovery is empty.
+    var xcodeDeveloperPath: String? { iosService.developerDirectoryPath }
+
+    let hostProxy: HostProxyController
+    let simulatorAttribution: SimulatorTrafficAttribution
 
     private let runner: any AndroidCommandRunning
     private let preferences: DeviceAttachmentPreferences
     private let defaults: UserDefaults
     private let runtimePaths: LensRuntimePaths
+    private let iosService: IOSDeviceService
+    private let guidedAttachments: IOSGuidedAttachmentStore
     private var attachedSnapshots: [String: ProxySnapshot] = [:]
     private var deviceAliases: [String: String] = [:]
     private var overlaySerials = Set<String>()
@@ -137,20 +160,31 @@ final class DeviceManager {
     init(
         defaults: UserDefaults = .standard,
         runtimePaths: LensRuntimePaths = .live(),
-        runner: any AndroidCommandRunning = CommandRunner()
+        runner: any AndroidCommandRunning = CommandRunner(),
+        iosService: IOSDeviceService = IOSDeviceService(),
+        hostProxy: HostProxyController? = nil,
+        simulatorAttribution: SimulatorTrafficAttribution = SimulatorTrafficAttribution()
     ) {
         self.defaults = defaults
         self.runtimePaths = runtimePaths
         self.runner = runner
+        self.iosService = iosService
+        self.hostProxy = hostProxy ?? HostProxyController(defaults: defaults)
+        self.simulatorAttribution = simulatorAttribution
+        guidedAttachments = IOSGuidedAttachmentStore(defaults: defaults)
         preferences = DeviceAttachmentPreferences(defaults: defaults)
         loadSnapshots()
         migrateAttachmentSnapshotsToRememberedDevices()
         loadDeviceAliases()
     }
 
+    /// Devices Lens may reattach without being asked.
+    ///
+    /// iOS is excluded on purpose: attaching a simulator changes a system setting and
+    /// raises an administrator prompt, which must never happen unattended at launch.
     var rememberedDetachedDevices: [DeviceTarget] {
         devices.filter { target in
-            !target.isAttached && preferences.isRemembered(
+            target.platform == .android && !target.isAttached && preferences.isRemembered(
                 deviceID: target.aliasKey,
                 transportID: target.serial
             )
@@ -161,7 +195,7 @@ final class DeviceManager {
         if let remembered = rememberedDetachedDevices.first {
             return remembered
         }
-        return devices.first { $0.kind == .emulator && !$0.isAttached }
+        return devices.first { $0.platform == .android && $0.kind == .emulator && !$0.isAttached }
     }
 
     func refresh() async {
@@ -216,6 +250,21 @@ final class DeviceManager {
     }
 
     private func performRefresh() async {
+        let android = await discoverAndroidDevices()
+        let ios = await discoverIOSDevices()
+        switch android {
+        case let .some(discovered):
+            replaceDevices(with: discovered + ios)
+        case .none:
+            // A transient ADB failure must not flash the Android devices out of the
+            // sidebar, so reuse the last known Android list and refresh iOS only.
+            replaceDevices(with: devices.filter { $0.platform == .android } + ios)
+        }
+        await refreshVPNState()
+    }
+
+    /// Returns nil when ADB failed transiently and the previous list should stand.
+    private func discoverAndroidDevices() async -> [DeviceTarget]? {
         do {
             let serials = try await discoverConnectedSerials()
             var candidates: [(hardwareID: String, device: DeviceTarget)] = []
@@ -257,14 +306,105 @@ final class DeviceManager {
                     )
                 )
             }
-            replaceDevices(with: Self.deduplicatedDevices(candidates))
-            await refreshVPNState()
+            return Self.deduplicatedDevices(candidates)
         } catch DeviceManagerError.adbNotFound {
-            replaceDevices(with: [])
+            return []
         } catch {
             // A tracker event will retry after transient ADB/server failures.
             // Preserve the last snapshot instead of flashing an empty sidebar.
+            return nil
         }
+    }
+
+    /// Booted simulators, connected iPhones, and any device still under a guided
+    /// attachment even though Xcode no longer reports it.
+    private func discoverIOSDevices() async -> [DeviceTarget] {
+        var discovered: [DeviceTarget] = []
+        var seenIdentifiers = Set<String>()
+
+        let simulators = (try? await iosService.discoverSimulators()) ?? []
+        if availableSimulators != simulators { availableSimulators = simulators }
+        for simulator in simulators where simulator.isBooted {
+            let storedSnapshot = attachedSnapshots[simulator.udid]
+            discovered.append(
+                DeviceTarget(
+                    serial: simulator.udid,
+                    model: simulator.name,
+                    apiLevel: 0,
+                    kind: .emulator,
+                    // The trust store is writable, so a simulator always supports
+                    // decryption once Lens installs its certificate.
+                    rootState: .available,
+                    isAttached: storedSnapshot != nil,
+                    previousProxy: nil,
+                    caInstalled: storedSnapshot != nil,
+                    networkAddresses: [],
+                    hardwareID: simulator.udid,
+                    platform: .ios,
+                    osVersion: simulator.osVersion,
+                    attachmentMode: .automatic
+                )
+            )
+            seenIdentifiers.insert(simulator.udid)
+        }
+
+        let guided = guidedAttachments.all()
+        for device in (try? await iosService.discoverPhysicalDevices()) ?? [] {
+            guard device.isConnected || guided.contains(where: { $0.identifier == device.identifier }) else { continue }
+            let attachment = guided.first { $0.identifier == device.identifier }
+            discovered.append(
+                Self.guidedTarget(
+                    identifier: device.identifier,
+                    hardwareUDID: device.hardwareUDID,
+                    name: device.name,
+                    osVersion: device.osVersion,
+                    isAttached: attachment != nil,
+                    boundAddress: attachment?.boundAddress
+                )
+            )
+            seenIdentifiers.insert(device.identifier)
+        }
+
+        // An attached iPhone keeps proxying after it is unplugged, so keep showing it.
+        for attachment in guided where !seenIdentifiers.contains(attachment.identifier) {
+            discovered.append(
+                Self.guidedTarget(
+                    identifier: attachment.identifier,
+                    hardwareUDID: attachment.hardwareUDID,
+                    name: attachment.name,
+                    osVersion: attachment.osVersion,
+                    isAttached: true,
+                    boundAddress: attachment.boundAddress
+                )
+            )
+        }
+        return discovered
+    }
+
+    private static func guidedTarget(
+        identifier: String,
+        hardwareUDID: String,
+        name: String,
+        osVersion: String,
+        isAttached: Bool,
+        boundAddress: String?
+    ) -> DeviceTarget {
+        DeviceTarget(
+            serial: identifier,
+            model: name,
+            apiLevel: 0,
+            kind: .physical,
+            // Certificate trust is the user's job on a physical device.
+            rootState: .unknown,
+            isAttached: isAttached,
+            previousProxy: nil,
+            caInstalled: false,
+            networkAddresses: boundAddress.map { [$0] } ?? [],
+            hardwareID: hardwareUDID,
+            platform: .ios,
+            osVersion: osVersion,
+            attachmentMode: .guided
+        )
     }
 
     static func parseConnectedDeviceSerials(_ output: String) -> [String] {
@@ -338,6 +478,156 @@ final class DeviceManager {
     }
 
     func attach(_ target: DeviceTarget, proxyPort: Int, stopConflictingVPN: Bool = false) async throws {
+        switch target.platform {
+        case .android:
+            try await attachAndroid(target, proxyPort: proxyPort, stopConflictingVPN: stopConflictingVPN)
+        case .ios:
+            try await attachIOS(target, proxyPort: proxyPort)
+        }
+    }
+
+    func detach(_ target: DeviceTarget, forgetRememberedDevice: Bool = true) async throws {
+        switch target.platform {
+        case .android:
+            try await detachAndroid(target, forgetRememberedDevice: forgetRememberedDevice)
+        case .ios:
+            try await detachIOS(target, forgetRememberedDevice: forgetRememberedDevice)
+        }
+    }
+
+    // MARK: - iOS attachment
+
+    /// Boots the simulator if needed, trusts the Lens certificate inside it, then points
+    /// the Mac's system proxy at Lens because a simulator shares the host network stack.
+    private func attachIOS(_ target: DeviceTarget, proxyPort: Int) async throws {
+        guard !target.isAttached, attachedSnapshots[target.aliasKey] == nil else {
+            throw DeviceManagerError.alreadyAttached(target.serial)
+        }
+        guard target.attachmentMode == .automatic else {
+            try attachGuidedIOS(target)
+            return
+        }
+
+        try Task.checkCancellation()
+        try await iosService.boot(simulator: target.serial)
+        try await iosService.waitUntilBooted(udid: target.serial)
+
+        try Task.checkCancellation()
+        try await waitForCertificate()
+        try await iosService.installRootCertificate(
+            udid: target.serial,
+            certificateURL: runtimePaths.certificateURL
+        )
+
+        try Task.checkCancellation()
+        // Nothing needs undoing if this fails: the certificate is inert until traffic
+        // is actually proxied.
+        try await hostProxy.apply(port: proxyPort)
+        await simulatorAttribution.setMapObserver { [weak self] map in
+            Task { @MainActor [weak self] in
+                guard let self, self.simulatorUDIDByClientPort != map else { return }
+                self.simulatorUDIDByClientPort = map
+                self.onSimulatorAttributionChanged?()
+            }
+        }
+        await simulatorAttribution.startMonitoring(proxyPort: proxyPort)
+
+        // An empty snapshot marks the attachment as live across refreshes. The proxy
+        // settings to restore live in the host proxy snapshot, not here.
+        attachedSnapshots[target.aliasKey] = ProxySnapshot(host: nil, port: nil)
+        persistSnapshots()
+        updateDevice(target.serial) {
+            $0.isAttached = true
+            $0.caInstalled = true
+            $0.rootState = .available
+        }
+    }
+
+    /// Records a manual attachment for a physical device. The user configures the Wi-Fi
+    /// proxy and certificate on the device itself.
+    private func attachGuidedIOS(_ target: DeviceTarget) throws {
+        guidedAttachments.save(
+            GuidedIOSAttachment(
+                identifier: target.serial,
+                hardwareUDID: target.hardwareID ?? target.serial,
+                name: target.model,
+                marketingName: target.model,
+                osVersion: target.osVersion,
+                boundAddress: target.networkAddresses.first
+            )
+        )
+        updateDevice(target.serial) { $0.isAttached = true }
+    }
+
+    private func detachIOS(_ target: DeviceTarget, forgetRememberedDevice: Bool) async throws {
+        if forgetRememberedDevice {
+            preferences.forget(deviceID: target.aliasKey, transportID: target.serial)
+        }
+        if target.attachmentMode == .guided {
+            guidedAttachments.remove(identifier: target.serial)
+            updateDevice(target.serial) { $0.isAttached = false }
+            return
+        }
+
+        attachedSnapshots.removeValue(forKey: target.aliasKey)
+        attachedSnapshots.removeValue(forKey: target.serial)
+        persistSnapshots()
+        updateDevice(target.serial) {
+            $0.isAttached = false
+            $0.caInstalled = false
+        }
+        // The host proxy is shared by every attached simulator, so only the last one out
+        // restores it.
+        if !hasAttachedSimulator {
+            await simulatorAttribution.stopMonitoring()
+            try await hostProxy.restore()
+        }
+    }
+
+    /// True while any simulator still needs the host proxy pointed at Lens.
+    private var hasAttachedSimulator: Bool {
+        devices.contains { $0.isSimulator && $0.isAttached }
+    }
+
+    /// Records the address a guided device's traffic arrives from, so later flows are
+    /// attributed without waiting for another probe.
+    func bindGuidedDevice(serial: String, address: String) {
+        guard guidedAttachments.contains(identifier: serial) else { return }
+        guidedAttachments.bind(identifier: serial, address: address)
+        updateDevice(serial) {
+            if !$0.networkAddresses.contains(address) { $0.networkAddresses.append(address) }
+        }
+    }
+
+    /// Boots a simulator so it appears in `devices` and can be attached.
+    func bootSimulator(udid: String) async throws {
+        try await iosService.boot(simulator: udid)
+        try await iosService.waitUntilBooted(udid: udid)
+        await refresh()
+    }
+
+    /// The address a physical device must point its Wi-Fi proxy at.
+    func hostAddressForGuidedSetup() throws -> String {
+        try localIPAddress()
+    }
+
+    /// Learns a guided device's address from its first captured flow.
+    ///
+    /// Only applied when exactly one guided device is still unbound, so traffic is never
+    /// attributed to the wrong iPhone.
+    func bindGuidedDeviceIfNeeded(clientAddress: String) {
+        guard !clientAddress.isEmpty, clientAddress != "Unknown" else { return }
+        guard !devices.contains(where: { $0.networkAddresses.contains(clientAddress) }) else { return }
+        let unbound = devices.filter {
+            $0.platform == .ios && $0.attachmentMode == .guided && $0.isAttached && $0.networkAddresses.isEmpty
+        }
+        guard unbound.count == 1, let target = unbound.first else { return }
+        bindGuidedDevice(serial: target.serial, address: clientAddress)
+    }
+
+    // MARK: - Android attachment
+
+    private func attachAndroid(_ target: DeviceTarget, proxyPort: Int, stopConflictingVPN: Bool) async throws {
         guard !target.isAttached,
               attachedSnapshots[target.aliasKey] == nil,
               attachedSnapshots[target.serial] == nil else {
@@ -444,7 +734,7 @@ final class DeviceManager {
         }
     }
 
-    func detach(_ target: DeviceTarget, forgetRememberedDevice: Bool = true) async throws {
+    private func detachAndroid(_ target: DeviceTarget, forgetRememberedDevice: Bool) async throws {
         if forgetRememberedDevice {
             preferences.forget(deviceID: target.aliasKey, transportID: target.serial)
         }
@@ -484,9 +774,24 @@ final class DeviceManager {
     }
 
     func recoverPreviousAttachments() async -> ProxyRestorationReport {
-        guard !attachedSnapshots.isEmpty else { return ProxyRestorationReport() }
+        guard !attachedSnapshots.isEmpty || hostProxy.hasRecoverableSnapshot else {
+            return ProxyRestorationReport()
+        }
         await refresh()
-        return await restoreAttachedDevicesAndWait()
+        var report = await restoreAttachedDevicesAndWait()
+        // A crash can leave the Mac pointing at a Lens proxy that is no longer running,
+        // with no simulator left in the list to detach.
+        if hostProxy.hasRecoverableSnapshot, !hasAttachedSimulator {
+            do {
+                await simulatorAttribution.stopMonitoring()
+                try await hostProxy.restore()
+            } catch {
+                report.failures.append(
+                    ProxyRestorationFailure(serial: "macOS system proxy", message: error.localizedDescription)
+                )
+            }
+        }
+        return report
     }
 
     func prepareUITestDevices(_ fixtures: [DeviceTarget]) {
@@ -662,7 +967,7 @@ final class DeviceManager {
     }
 
     private func refreshVPNState() async {
-        guard let first = devices.first else {
+        guard let first = devices.first(where: { $0.platform == .android }) else {
             activeVPNPackage = nil
             return
         }
