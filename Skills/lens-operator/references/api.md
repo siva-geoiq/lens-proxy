@@ -31,16 +31,22 @@ Every JSON response contains `apiVersion`, `requestId`, and either `data` or `er
 | POST | `/v1/mappings/{id}/duplicate` | Duplicate a mapping |
 | PUT | `/v1/mappings/order` | Replace mapping order |
 | POST | `/v1/sessions/save`, `/open` | Save or open an absolute `.mitm` path |
-| GET | `/v1/devices` | Connected ADB devices and sync state |
-| POST | `/v1/devices/refresh` | Refresh ADB discovery |
+| GET | `/v1/devices` | Connected Android and iOS devices and sync state |
+| POST | `/v1/devices/refresh` | Refresh ADB and Xcode device discovery |
 | GET/PATCH | `/v1/devices/{serial}` | Read or rename/reset a device |
-| POST | `/v1/devices/{serial}/attach`, `/detach` | Change Android proxy attachment |
-| GET/PUT | `/v1/devices/{serial}/inspection` | Read or select inspection mode |
+| POST | `/v1/devices/{serial}/attach`, `/detach` | Change proxy attachment |
+| GET/PUT | `/v1/devices/{serial}/inspection` | Read or select inspection mode (Android only) |
 | GET | `/v1/devices/{serial}/inspection/processes` | Debuggable processes |
 | GET | `/v1/devices/{serial}/shared-preferences/apps` | Apps accessible through Android `run-as` |
 | GET | `/v1/devices/{serial}/shared-preferences/{package}` | Preference files, typed entries, and package ETag |
 | GET | `/v1/devices/{serial}/shared-preferences/{package}/{file}` | One preference file with the package ETag |
 | POST | `/v1/devices/{serial}/shared-preferences/{package}/apply` | Atomically apply complete replacement entries for changed files |
+
+### Device platforms
+
+Each device item carries `platform` (`android` or `ios`), `osVersion`, `kind` (`emulator` or `physical`) and `attachmentMode` (`automatic` or `guided`). Android reports `apiLevel` and `rootState`; iOS reports `osVersion`.
+
+`inspection` and `shared-preferences` routes exist for Android only and answer `409 android_only` for an iOS serial. Attaching an iOS simulator points the macOS system proxy at Lens and prompts the user's Mac for administrator approval; detaching the last attached simulator restores the previous settings. A `guided` device is configured by hand on the device itself, so `attach` only records the intent and Lens learns its address from the first captured flow.
 
 ## Flows and pagination
 

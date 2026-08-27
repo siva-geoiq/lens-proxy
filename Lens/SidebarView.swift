@@ -95,7 +95,7 @@ struct SidebarView: View {
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     .frame(width: 10)
                     .accessibilityHidden(true)
-                Image(systemName: device.kind == .emulator ? "apps.iphone" : "iphone")
+                Image(systemName: device.symbolName)
                     .foregroundStyle(deviceFlows.isEmpty ? Color.secondary : Color.blue)
                     .frame(width: 18)
                     .accessibilityHidden(true)
@@ -112,7 +112,7 @@ struct SidebarView: View {
                         device: device,
                         isSyncing: model.attachingDeviceID == device.serial
                     )
-                    if device.isAttached {
+                    if device.isAttached && device.supportsAndroidTooling {
                         DeepInspectionStatusView(device: device, compact: true)
                     }
                 }
@@ -160,16 +160,18 @@ struct SidebarView: View {
                 )
             }
 
-            Divider()
+            if device.supportsAndroidTooling {
+                Divider()
 
-            Button {
-                preferencesDevice = device
-            } label: {
-                Label("Shared Preferences…", systemImage: "slider.horizontal.2.square")
+                Button {
+                    preferencesDevice = device
+                } label: {
+                    Label("Shared Preferences…", systemImage: "slider.horizontal.2.square")
+                }
+
+                DeepInspectionMenu(device: device)
+                    .disabled(!device.isAttached)
             }
-
-            DeepInspectionMenu(device: device)
-                .disabled(!device.isAttached)
 
             Divider()
 

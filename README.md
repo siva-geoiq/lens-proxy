@@ -1,6 +1,24 @@
 # Lens
 
-Lens is a native macOS network-debugging suite for Android, powered by a bundled mitmproxy engine and bundled ADB tools.
+Lens is a native macOS network-debugging suite for Android and iOS, powered by a bundled mitmproxy engine and bundled ADB tools.
+
+## Devices
+
+The Devices window lists Android devices and emulators discovered through the bundled ADB, plus iOS simulators and iPhones discovered through Xcode's `simctl` and `devicectl`. iOS support needs Xcode installed; Apple does not allow those tools to be redistributed, so Lens cannot bundle them.
+
+Attaching differs by platform:
+
+| Target | How Lens attaches |
+| --- | --- |
+| Android device or emulator | Sets the device's `http_proxy` settings over ADB and installs the Lens CA into the system store when root is available. |
+| iOS simulator | Boots the simulator if needed, adds the Lens CA to its trusted root store with `simctl keychain`, then points the **macOS system HTTP(S) proxy** at Lens. |
+| iPhone or iPad | Guided: Lens shows the proxy address and certificate steps to enter on the device, because iOS exposes no way to set them from a Mac. |
+
+A simulator has no network stack of its own — it uses the Mac's, and CFNetwork inside it reads the host's proxy configuration. Attaching one therefore changes a system setting, which macOS protects: Lens asks for administrator approval, records the previous configuration, and restores it when the last simulator detaches, when Lens quits, or on the next launch after a crash. While a simulator is attached, this Mac's own traffic is captured too; it appears under **Local machine**.
+
+Simulator traffic and the Mac's own traffic both arrive from `127.0.0.1`, so Lens attributes each flow by finding the process that owns the connecting socket and walking its parent chain to the simulator's `launchd_sim`. Flows it cannot attribute stay under **Local machine** rather than being guessed at.
+
+Shared Preferences and Deep Inspection work through ADB and remain Android-only; the corresponding API routes reject an iOS serial with `android_only`.
 
 ## Install the unsigned release
 

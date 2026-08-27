@@ -20,6 +20,26 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            Section("iOS") {
+                LabeledContent("Xcode tools") {
+                    if let developerPath = model.devices.xcodeDeveloperPath {
+                        Label(developerPath, systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    } else {
+                        Label("Not found — install Xcode", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+                LabeledContent("System proxy") {
+                    Text(
+                        model.devices.hostProxy.isApplied
+                            ? "Routed to Lens for attached simulators"
+                            : "Untouched"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+            }
             Section("Agent API") {
                 LabeledContent("Status") {
                     Label(apiStatus, systemImage: apiStatusIcon)

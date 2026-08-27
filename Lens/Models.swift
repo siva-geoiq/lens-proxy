@@ -120,6 +120,9 @@ struct AndroidRequestContext: Codable, Hashable, Sendable {
 struct FlowRecord: Codable, Hashable, Identifiable, Sendable {
     var id: String
     var clientAddress: String
+    /// Source port of the client connection, used to attribute loopback traffic to an
+    /// iOS simulator. Absent for flows captured before Lens reported it.
+    var clientPort: Int? = nil
     var method: String
     var scheme: String
     var host: String
@@ -442,6 +445,28 @@ enum DeviceKind: String, Codable, Sendable {
     case physical
 }
 
+enum DevicePlatform: String, Codable, Sendable {
+    case android
+    case ios
+
+    var displayName: String {
+        switch self {
+        case .android: "Android"
+        case .ios: "iOS"
+        }
+    }
+}
+
+/// How Lens can route a device's traffic.
+///
+/// Android devices and iOS simulators are configured by Lens directly. A physical
+/// iPhone or iPad has no programmable proxy setting, so the user configures it by hand
+/// while Lens shows the values and waits for traffic.
+enum DeviceAttachmentMode: String, Codable, Sendable {
+    case automatic
+    case guided
+}
+
 enum RootState: String, Codable, Sendable {
     case available
     case unavailable
@@ -461,6 +486,31 @@ struct DeviceTarget: Codable, Hashable, Identifiable, Sendable {
     var networkAddresses: [String] = []
     var hardwareID: String? = nil
     var customName: String? = nil
+    var platform: DevicePlatform = .android
+    /// Marketing OS version, for example `26.5`. Android reports `apiLevel` instead.
+    var osVersion: String = ""
+    var attachmentMode: DeviceAttachmentMode = .automatic
+
+    /// Shared Preferences, Deep Inspection and VPN detection all shell out through ADB.
+    var supportsAndroidTooling: Bool { platform == .android }
+
+    var isSimulator: Bool { platform == .ios && kind == .emulator }
+
+    var platformVersionText: String {
+        switch platform {
+        case .android: "Android API \(apiLevel)"
+        case .ios: osVersion.isEmpty ? "iOS" : "iOS \(osVersion)"
+        }
+    }
+
+    var symbolName: String {
+        switch (platform, kind) {
+        case (.ios, .emulator): "iphone.gen3.badge.play"
+        case (.ios, .physical): "iphone.gen3"
+        case (.android, .emulator): "apps.iphone"
+        case (.android, .physical): "iphone"
+        }
+    }
 
     var displayName: String {
         let trimmedName = customName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

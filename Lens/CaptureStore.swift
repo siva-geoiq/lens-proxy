@@ -48,6 +48,10 @@ final class CaptureStore {
         return flows.first { $0.id == selectedFlowID }
     }
 
+    /// Resolves a loopback client port to the iOS simulator UDID that owns it.
+    /// Set by `LensModel`; nil when no simulator is attached.
+    @ObservationIgnored var simulatorUDIDResolver: (@MainActor (Int) -> String?)?
+
     func flows(forDeviceID deviceID: String?) -> [FlowRecord] {
         flows.filter { $0.deviceID == deviceID }
     }
@@ -145,14 +149,29 @@ final class CaptureStore {
 
     func attributed(_ flow: FlowRecord, to devices: [DeviceTarget]) -> FlowRecord {
         var result = flow
-        let emulators = devices.filter { $0.kind == .emulator }
-        let matchedDevice = devices.first { device in
-            device.networkAddresses.contains(flow.clientAddress) ||
-                (isLoopback(flow.clientAddress) && device.kind == .emulator && emulators.count == 1)
-        }
+        let matchedDevice = matchingDevice(for: flow, in: devices)
         result.deviceID = matchedDevice?.serial
         result.deviceName = matchedDevice?.displayName
         return result
+    }
+
+    private func matchingDevice(for flow: FlowRecord, in devices: [DeviceTarget]) -> DeviceTarget? {
+        if let device = devices.first(where: { $0.networkAddresses.contains(flow.clientAddress) }) {
+            return device
+        }
+        guard isLoopback(flow.clientAddress) else { return nil }
+
+        // An iOS simulator shares the Mac's loopback address with every other simulator
+        // and with the Mac's own apps, so the owning process decides.
+        if let port = flow.clientPort,
+           let udid = simulatorUDIDResolver?(port),
+           let device = devices.first(where: { $0.serial == udid }) {
+            return device
+        }
+
+        // Android emulators have no such resolver; a single emulator is unambiguous.
+        let androidEmulators = devices.filter { $0.platform == .android && $0.kind == .emulator }
+        return androidEmulators.count == 1 ? androidEmulators.first : nil
     }
 
     func clear() {

@@ -289,6 +289,7 @@ class LensAddon:
         return {
             "id": flow.id,
             "clientAddress": peer[0] if peer else "Unknown",
+            "clientPort": peer[1] if peer and len(peer) > 1 else None,
             "method": request.method,
             "scheme": request.scheme,
             "host": request.host,
