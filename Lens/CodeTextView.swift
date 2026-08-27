@@ -4,6 +4,8 @@ import SwiftUI
 struct CodeTextView: NSViewRepresentable {
     @Binding var text: String
     var isEditable: Bool
+    var searchTerm: String = ""
+    var activeMatchIndex: Int = 0
 
     func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
@@ -42,10 +44,36 @@ struct CodeTextView: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         textView.isEditable = isEditable
         if textView.string != text { textView.string = text }
+        applyHighlights(in: textView, context: context)
+    }
+
+    private func applyHighlights(in textView: NSTextView, context: Context) {
+        let matches = TextSearch.ranges(of: searchTerm, in: textView.string)
+        let hadHighlights = context.coordinator.hasHighlights
+        guard !matches.isEmpty || hadHighlights else { return }
+        guard let storage = textView.textStorage else { return }
+
+        let fullRange = NSRange(location: 0, length: (textView.string as NSString).length)
+        storage.beginEditing()
+        storage.removeAttribute(.backgroundColor, range: fullRange)
+        for (index, match) in matches.enumerated() {
+            let isActive = index == activeMatchIndex
+            let color = isActive
+                ? NSColor.systemOrange.withAlphaComponent(0.65)
+                : NSColor.systemYellow.withAlphaComponent(0.35)
+            storage.addAttribute(.backgroundColor, value: color, range: match)
+        }
+        storage.endEditing()
+        context.coordinator.hasHighlights = !matches.isEmpty
+
+        if matches.indices.contains(activeMatchIndex) {
+            textView.scrollRangeToVisible(matches[activeMatchIndex])
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         @Binding private var text: String
+        var hasHighlights = false
 
         init(text: Binding<String>) { _text = text }
 

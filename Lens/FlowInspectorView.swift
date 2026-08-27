@@ -134,6 +134,11 @@ private struct MessageInspector: View {
     let isFullscreen: Bool
     let toggleFullscreen: () -> Void
     @State private var editedRuleID: UUID?
+    @State private var isSearchVisible = false
+    @State private var searchTerm = ""
+    @State private var activeMatch = 0
+    @State private var jsonMatchCount = 0
+    @FocusState private var searchFieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -149,6 +154,22 @@ private struct MessageInspector: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("Copy \(title) JSON payload")
                     .help("Copy \(title.lowercased()) JSON payload")
+                }
+                if isSearchable {
+                    Button {
+                        isSearchVisible.toggle()
+                        if isSearchVisible {
+                            searchFieldFocused = true
+                        } else {
+                            searchTerm = ""
+                        }
+                    } label: {
+                        Image(systemName: "text.magnifyingglass")
+                            .foregroundStyle(isSearchVisible ? Color.accentColor : Color.primary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Find in \(title.lowercased())")
+                    .help("Find in \(title.lowercased())")
                 }
                 Button(action: toggleFullscreen) {
                     Image(systemName: isFullscreen
@@ -173,11 +194,25 @@ private struct MessageInspector: View {
             }
             .pickerStyle(.segmented)
             .padding(8)
+            if isSearchVisible && isSearchable {
+                InspectorFindBar(
+                    term: $searchTerm,
+                    activeMatch: $activeMatch,
+                    matchCount: matchCount,
+                    onClose: {
+                        isSearchVisible = false
+                        searchTerm = ""
+                        searchFieldFocused = false
+                    },
+                    isFocused: $searchFieldFocused
+                )
+                Divider()
+            }
             Group {
                 switch selectedTab {
                 case "Header": headerContent
-                case "Query": CodeTextView(text: .constant(query), isEditable: false)
-                case "Raw": CodeTextView(text: .constant(raw), isEditable: false)
+                case "Query": searchableText(query)
+                case "Raw": searchableText(raw)
                 case "WebSocket": WebSocketFramesView(frames: frames)
                 case "JSON": jsonContent
                 case "Tree": treeContent
@@ -187,6 +222,45 @@ private struct MessageInspector: View {
             }
         }
         .frame(minWidth: 0, maxWidth: .infinity)
+        .onChange(of: selectedTab) { activeMatch = 0 }
+        .onChange(of: searchTerm) { activeMatch = 0 }
+        .onChange(of: matchCount) {
+            if activeMatch >= matchCount { activeMatch = 0 }
+        }
+    }
+
+    /// Tabs whose content is plain or JSON text can be searched in place.
+    private var isSearchable: Bool {
+        !["WebSocket", "Tree", "Android"].contains(selectedTab)
+    }
+
+    private var searchedText: String {
+        switch selectedTab {
+        case "Header": headers.map { "\($0.name): \($0.value)" }.joined(separator: "\n")
+        case "Query": query
+        case "Raw": raw
+        case "JSON": ""
+        default: bodyText
+        }
+    }
+
+    private var matchCount: Int {
+        guard !searchTerm.isEmpty else { return 0 }
+        if selectedTab == "JSON" { return jsonMatchCount }
+        return TextSearch.ranges(of: searchTerm, in: searchedText).count
+    }
+
+    private var bodyText: String {
+        messageBody?.text ?? messageBody?.hexPreview ?? ""
+    }
+
+    private func searchableText(_ value: String) -> some View {
+        CodeTextView(
+            text: .constant(value),
+            isEditable: false,
+            searchTerm: searchTerm,
+            activeMatchIndex: activeMatch
+        )
     }
 
     @ViewBuilder
@@ -198,7 +272,12 @@ private struct MessageInspector: View {
                 description: Text("This body was truncated or evicted.")
             )
         } else if let messageBody, messageBody.isJSON {
-            JSONSyntaxViewer(data: treeBodyData)
+            JSONSyntaxViewer(
+                data: treeBodyData,
+                searchTerm: searchTerm,
+                activeMatchIndex: activeMatch,
+                onMatchCountChange: { jsonMatchCount = $0 }
+            )
         } else {
             ContentUnavailableView(
                 "JSON viewer unavailable",
@@ -317,10 +396,7 @@ private struct MessageInspector: View {
                 .padding(.vertical, 6)
                 .background(.quaternary.opacity(0.35))
             }
-            CodeTextView(
-                text: .constant(headers.map { "\($0.name): \($0.value)" }.joined(separator: "\n")),
-                isEditable: false
-            )
+            searchableText(headers.map { "\($0.name): \($0.value)" }.joined(separator: "\n"))
         }
     }
 
@@ -341,10 +417,7 @@ private struct MessageInspector: View {
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            CodeTextView(
-                text: .constant(formatted ? messageBody?.formattedText ?? "" : messageBody?.text ?? messageBody?.hexPreview ?? ""),
-                isEditable: false
-            )
+            searchableText(formatted ? messageBody?.formattedText ?? "" : bodyText)
         }
     }
 }

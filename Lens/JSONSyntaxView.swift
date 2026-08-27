@@ -229,8 +229,19 @@ struct JSONSyntaxViewer: View {
 
     private let document: JSONValue?
     private let parseError: String?
+    private let searchTerm: String
+    private let activeMatchIndex: Int
+    private let onMatchCountChange: ((Int) -> Void)?
 
-    init(data: Data) {
+    init(
+        data: Data,
+        searchTerm: String = "",
+        activeMatchIndex: Int = 0,
+        onMatchCountChange: ((Int) -> Void)? = nil
+    ) {
+        self.searchTerm = searchTerm
+        self.activeMatchIndex = activeMatchIndex
+        self.onMatchCountChange = onMatchCountChange
         do {
             document = try JSONValue.decodeJSON(from: data)
             parseError = nil
@@ -244,18 +255,32 @@ struct JSONSyntaxViewer: View {
         if let document {
             GeometryReader { viewport in
                 let renderedLines = lines(for: document)
+                let matchOffsets = matchOffsets(for: renderedLines)
+                let totalMatches = matchOffsets.last ?? 0
                 let contentWidth = max(viewport.size.width, minimumContentWidth(for: renderedLines))
-                ScrollView([.horizontal, .vertical]) {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(renderedLines.enumerated()), id: \.element.id) { index, line in
-                            syntaxLine(line, number: index + 1)
+                ScrollViewReader { scroller in
+                    ScrollView([.horizontal, .vertical]) {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(Array(renderedLines.enumerated()), id: \.element.id) { index, line in
+                                syntaxLine(line, number: index + 1, firstMatchIndex: matchOffsets[index])
+                                    .id(line.id)
+                            }
+                        }
+                        .padding(.vertical, 8)
+                        .frame(width: contentWidth, alignment: .topLeading)
+                        .frame(minHeight: viewport.size.height, alignment: .topLeading)
+                    }
+                    .frame(width: viewport.size.width, height: viewport.size.height, alignment: .topLeading)
+                    .task(id: totalMatches) { onMatchCountChange?(totalMatches) }
+                    .onChange(of: activeMatchIndex, initial: true) {
+                        guard totalMatches > 0,
+                              let lineIndex = renderedLines.indices.last(where: { matchOffsets[$0] <= activeMatchIndex }),
+                              matchOffsets[lineIndex + 1] > activeMatchIndex else { return }
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            scroller.scrollTo(renderedLines[lineIndex].id, anchor: .center)
                         }
                     }
-                    .padding(.vertical, 8)
-                    .frame(width: contentWidth, alignment: .topLeading)
-                    .frame(minHeight: viewport.size.height, alignment: .topLeading)
                 }
-                .frame(width: viewport.size.width, height: viewport.size.height, alignment: .topLeading)
             }
         } else {
             ContentUnavailableView(
@@ -280,7 +305,19 @@ struct JSONSyntaxViewer: View {
         return ceil(widestLine + 38 + 8 + 18 + 12 + 12)
     }
 
-    private func syntaxLine(_ line: JSONSyntaxLine, number: Int) -> some View {
+    /// Running count of search matches before each line; the final element is the total.
+    private func matchOffsets(for lines: [JSONSyntaxLine]) -> [Int] {
+        var offsets: [Int] = [0]
+        offsets.reserveCapacity(lines.count + 1)
+        var running = 0
+        for line in lines {
+            running += TextSearch.ranges(of: searchTerm, in: line.plainText).count
+            offsets.append(running)
+        }
+        return offsets
+    }
+
+    private func syntaxLine(_ line: JSONSyntaxLine, number: Int, firstMatchIndex: Int) -> some View {
         HStack(spacing: 0) {
             Text("\(number)")
                 .font(.caption2.monospacedDigit())
@@ -314,7 +351,7 @@ struct JSONSyntaxViewer: View {
                 Color.clear.frame(width: 18, height: 18)
             }
 
-            coloredText(line.tokens)
+            coloredText(line.tokens, firstMatchIndex: firstMatchIndex)
                 .font(.system(size: 12, design: .monospaced))
                 .textSelection(.enabled)
                 .fixedSize(horizontal: true, vertical: false)
@@ -325,14 +362,42 @@ struct JSONSyntaxViewer: View {
         .padding(.horizontal, 6)
     }
 
-    private func coloredText(_ tokens: [JSONSyntaxToken]) -> Text {
+    private func coloredText(_ tokens: [JSONSyntaxToken], firstMatchIndex: Int) -> Text {
         var value = AttributedString()
         for token in tokens {
             var fragment = AttributedString(token.text)
             fragment.foregroundColor = color(for: token.kind)
             value.append(fragment)
         }
-        return Text(value)
+        return Text(highlighted(value, firstMatchIndex: firstMatchIndex))
+    }
+
+    private func highlighted(_ value: AttributedString, firstMatchIndex: Int) -> AttributedString {
+        let plain = String(value.characters)
+        let matches = TextSearch.ranges(of: searchTerm, in: plain)
+        guard !matches.isEmpty else { return value }
+
+        var result = value
+        for (offset, match) in matches.enumerated() {
+            guard let range = Range(match, in: plain) else { continue }
+            let start = plain.distance(from: plain.startIndex, to: range.lowerBound)
+            let length = plain.distance(from: range.lowerBound, to: range.upperBound)
+            let characters = result.characters
+            guard let lower = characters.index(
+                characters.startIndex,
+                offsetBy: start,
+                limitedBy: characters.endIndex
+            ), let upper = characters.index(
+                lower,
+                offsetBy: length,
+                limitedBy: characters.endIndex
+            ) else { continue }
+            let isActive = firstMatchIndex + offset == activeMatchIndex
+            result[lower..<upper].backgroundColor = isActive
+                ? Color.orange.opacity(0.65)
+                : Color.yellow.opacity(0.35)
+        }
+        return result
     }
 
     private func color(for kind: JSONSyntaxToken.Kind) -> Color {
