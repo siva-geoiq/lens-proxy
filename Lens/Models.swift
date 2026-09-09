@@ -227,6 +227,55 @@ enum FlowKind: String, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 }
 
+/// Preset added latencies that stand in for a slower mobile radio.
+///
+/// Lens cannot shape bandwidth, so a profile is expressed purely as the delay
+/// Lens holds a matched request for before the client sees a response. The
+/// values are typical round-trip times for each generation of network.
+enum NetworkProfile: String, Codable, CaseIterable, Identifiable, Sendable {
+    case unthrottled
+    case fiveG
+    case fourG
+    case threeG
+    case twoG
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .unthrottled: "No delay"
+        case .fiveG: "5G"
+        case .fourG: "4G LTE"
+        case .threeG: "3G"
+        case .twoG: "2G EDGE"
+        }
+    }
+
+    var delayMilliseconds: Int {
+        switch self {
+        case .unthrottled: 0
+        case .fiveG: 30
+        case .fourG: 100
+        case .threeG: 300
+        case .twoG: 800
+        }
+    }
+
+    /// A held request occupies a proxy connection for the whole delay, so an
+    /// accidental extra digit must not wedge the engine.
+    static let maximumDelayMilliseconds = 60_000
+
+    static func clampDelay(_ milliseconds: Int) -> Int {
+        min(max(0, milliseconds), maximumDelayMilliseconds)
+    }
+
+    /// The profile whose preset matches `milliseconds` exactly, or `nil` for a
+    /// delay the user typed by hand.
+    static func profile(forDelay milliseconds: Int) -> NetworkProfile? {
+        allCases.first { $0.delayMilliseconds == milliseconds }
+    }
+}
+
 struct MappingRule: Codable, Hashable, Identifiable, Sendable {
     var id: UUID
     var name: String
@@ -248,6 +297,9 @@ struct MappingRule: Codable, Hashable, Identifiable, Sendable {
     var requestHeaders: [HeaderField]
     var rewriteBody: Bool
     var requestBody: BodyPayload
+    /// Added latency in milliseconds applied to every request this rule matches,
+    /// simulating a slower network. Zero forwards at full speed.
+    var delayMilliseconds: Int
 
     init(
         id: UUID,
@@ -269,7 +321,8 @@ struct MappingRule: Codable, Hashable, Identifiable, Sendable {
         rewriteHeaders: Bool = false,
         requestHeaders: [HeaderField] = [],
         rewriteBody: Bool = false,
-        requestBody: BodyPayload = .empty
+        requestBody: BodyPayload = .empty,
+        delayMilliseconds: Int = 0
     ) {
         self.id = id
         self.name = name
@@ -291,12 +344,14 @@ struct MappingRule: Codable, Hashable, Identifiable, Sendable {
         self.requestHeaders = requestHeaders
         self.rewriteBody = rewriteBody
         self.requestBody = requestBody
+        self.delayMilliseconds = delayMilliseconds
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, enabled, order, method, scheme, host, port, path
         case matchQuery, query, statusCode, responseHeaders, responseBody, sourceFlowID
         case behavior, rewriteHeaders, requestHeaders, rewriteBody, requestBody
+        case delayMilliseconds
     }
 
     init(from decoder: Decoder) throws {
@@ -321,6 +376,23 @@ struct MappingRule: Codable, Hashable, Identifiable, Sendable {
         requestHeaders = try container.decodeIfPresent([HeaderField].self, forKey: .requestHeaders) ?? []
         rewriteBody = try container.decodeIfPresent(Bool.self, forKey: .rewriteBody) ?? false
         requestBody = try container.decodeIfPresent(BodyPayload.self, forKey: .requestBody) ?? .empty
+        delayMilliseconds = NetworkProfile.clampDelay(
+            try container.decodeIfPresent(Int.self, forKey: .delayMilliseconds) ?? 0
+        )
+    }
+
+    /// The preset this rule's delay came from, or `nil` when the delay was typed
+    /// by hand and matches no preset.
+    var networkProfile: NetworkProfile? {
+        NetworkProfile.profile(forDelay: delayMilliseconds)
+    }
+
+    /// A short badge describing the simulated network, or `nil` when the rule
+    /// forwards at full speed.
+    var delaySummary: String? {
+        guard delayMilliseconds > 0 else { return nil }
+        guard let networkProfile else { return "\(delayMilliseconds) ms" }
+        return "\(networkProfile.title) · \(delayMilliseconds) ms"
     }
 
     var matchSummary: String {

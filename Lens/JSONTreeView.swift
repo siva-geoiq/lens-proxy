@@ -1,32 +1,56 @@
 import SwiftUI
 
 struct JSONTreeEditorView: View {
-    @State private var document: JSONValue
+    /// The edits the user has made but not saved, held by the caller so switching
+    /// inspector tabs does not throw them away. `nil` means the tree shows exactly
+    /// what Lens has stored.
+    @Binding var draft: JSONValue?
     @State private var collapsedPaths: Set<String> = []
 
     let isEditable: Bool
     let editingDescription: String
-    let onChange: (JSONValue) -> Void
+    let saveTitle: String
+    /// Called once per Save, never per keystroke, so one editing session produces
+    /// one mapping update instead of one per character typed.
+    let onSave: (JSONValue) -> Void
+    private let savedDocument: JSONValue
     private let parseError: String?
 
     init(
         data: Data,
+        draft: Binding<JSONValue?>,
         isEditable: Bool,
         editingDescription: String? = nil,
-        onChange: @escaping (JSONValue) -> Void
+        saveTitle: String = "Save",
+        onSave: @escaping (JSONValue) -> Void
     ) {
+        _draft = draft
         self.isEditable = isEditable
         self.editingDescription = editingDescription ?? (isEditable
-            ? "Edit any value to create or update this response's Local Mapping."
+            ? "Edit any value, then Save to create or update this response's Local Mapping."
             : "JSON values are read-only.")
-        self.onChange = onChange
+        self.saveTitle = saveTitle
+        self.onSave = onSave
         do {
-            _document = State(initialValue: try JSONValue.decodeJSON(from: data))
+            savedDocument = try JSONValue.decodeJSON(from: data)
             parseError = nil
         } catch {
-            _document = State(initialValue: .null)
+            savedDocument = .null
             parseError = error.localizedDescription
         }
+    }
+
+    private var hasUnsavedChanges: Bool {
+        guard isEditable, let draft else { return false }
+        return draft != savedDocument
+    }
+
+    /// Edits go to the draft; everything else reads the stored document.
+    private var document: Binding<JSONValue> {
+        Binding(
+            get: { draft ?? savedDocument },
+            set: { draft = $0 }
+        )
     }
 
     var body: some View {
@@ -54,7 +78,7 @@ struct JSONTreeEditorView: View {
                         JSONTreeNodeView(
                             name: "JSON",
                             path: "$",
-                            value: $document,
+                            value: document,
                             isEditable: isEditable,
                             collapsedPaths: $collapsedPaths
                         )
@@ -71,12 +95,44 @@ struct JSONTreeEditorView: View {
                         alignment: .topLeading
                     )
                 }
+                if isEditable { editorToolbar }
             }
         }
-        .onChange(of: document) { _, newValue in
-            guard isEditable else { return }
-            onChange(newValue)
+    }
+
+    private var editorToolbar: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 8) {
+                if hasUnsavedChanges {
+                    Label("Unsaved changes", systemImage: "pencil.circle.fill")
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("No unsaved changes")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Revert") { draft = nil }
+                    .accessibilityIdentifier("json-tree-revert")
+                    .disabled(!hasUnsavedChanges)
+                Button(saveTitle) { save() }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .accessibilityIdentifier("json-tree-save")
+                    .disabled(!hasUnsavedChanges)
+                    .help("Apply these edits to the mapping (\u{2318}\u{21A9})")
+            }
+            .font(.caption)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(.bar)
         }
+    }
+
+    private func save() {
+        guard hasUnsavedChanges, let edited = draft else { return }
+        // Saving stores this document, so the draft is no longer a departure from it.
+        draft = nil
+        onSave(edited)
     }
 }
 

@@ -509,6 +509,175 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(store.rules.first?.requestHeaders, [])
     }
 
+    func testTreeEditsReuseOneMappingAfterTheCapturedRuleWasDeleted() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("mappings.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = MappingStore(fileURL: fileURL)
+        var flow = makeFlow(id: "stale-flow", host: "api.example", mimeType: "application/json")
+        // The flow was served by a mapping the user has since deleted.
+        flow.mappedRuleID = UUID()
+        flow.rewrittenRuleID = UUID()
+
+        let responseIDs = (0..<3).map { index in
+            store.upsertResponseBody(
+                BodyPayload(
+                    data: Data(#"{"attempt":\#(index)}"#.utf8),
+                    isText: true,
+                    truncated: false,
+                    mimeType: "application/json"
+                ),
+                from: flow
+            )
+        }
+        let rewriteIDs = (0..<3).map { index in
+            store.upsertRequestBody(
+                BodyPayload(
+                    data: Data(#"{"attempt":\#(index)}"#.utf8),
+                    isText: true,
+                    truncated: false,
+                    mimeType: "application/json"
+                ),
+                from: flow
+            )
+        }
+
+        XCTAssertEqual(Set(responseIDs).count, 1)
+        XCTAssertEqual(Set(rewriteIDs).count, 1)
+        XCTAssertEqual(store.rules.count, 2)
+        XCTAssertEqual(store.rules.filter { $0.behavior == .localResponse }.count, 1)
+        XCTAssertEqual(store.rules.filter { $0.behavior == .rewriteRequest }.count, 1)
+        XCTAssertEqual(
+            store.rules.first { $0.behavior == .localResponse }?.responseBody.data,
+            Data(#"{"attempt":2}"#.utf8)
+        )
+    }
+
+    func testRequestRewriteCreationIgnoresADeletedCapturedRule() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("mappings.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = MappingStore(fileURL: fileURL)
+        var flow = makeFlow(id: "stale-rewrite-flow", host: "api.example")
+        flow.rewrittenRuleID = UUID()
+
+        let createdID = store.createRequestRewrite(from: flow)
+        let reusedID = store.createRequestHeaderRewrite(from: flow)
+
+        XCTAssertEqual(createdID, reusedID)
+        XCTAssertEqual(store.rules.count, 1)
+        XCTAssertEqual(store.rules.first?.id, createdID)
+        XCTAssertNotEqual(store.rules.first?.id, flow.rewrittenRuleID)
+    }
+
+    func testNetworkProfilePresetsDeriveFromTheStoredDelay() {
+        XCTAssertEqual(NetworkProfile.profile(forDelay: 0), .unthrottled)
+        XCTAssertEqual(NetworkProfile.profile(forDelay: NetworkProfile.threeG.delayMilliseconds), .threeG)
+        XCTAssertNil(NetworkProfile.profile(forDelay: 275))
+
+        XCTAssertEqual(NetworkProfile.clampDelay(-1), 0)
+        XCTAssertEqual(NetworkProfile.clampDelay(450), 450)
+        XCTAssertEqual(
+            NetworkProfile.clampDelay(NetworkProfile.maximumDelayMilliseconds + 1),
+            NetworkProfile.maximumDelayMilliseconds
+        )
+
+        // Faster generations must never wait longer than slower ones.
+        let ordered: [NetworkProfile] = [.unthrottled, .fiveG, .fourG, .threeG, .twoG]
+        XCTAssertEqual(ordered.map(\.delayMilliseconds), ordered.map(\.delayMilliseconds).sorted())
+    }
+
+    func testMappingRuleDelaySurvivesCodingAndDefaultsForOlderFiles() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("mappings.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = MappingStore(fileURL: fileURL)
+        let ruleID = store.addBlank(behavior: .localResponse)
+        guard var rule = store.rules.first else { return XCTFail("Expected a blank rule") }
+        XCTAssertEqual(rule.delayMilliseconds, 0)
+        XCTAssertEqual(rule.networkProfile, .unthrottled)
+        XCTAssertNil(rule.delaySummary)
+
+        rule.delayMilliseconds = NetworkProfile.twoG.delayMilliseconds
+        store.update(rule)
+        XCTAssertEqual(store.rules.first?.networkProfile, .twoG)
+        XCTAssertEqual(store.rules.first?.delaySummary, "2G EDGE · 800 ms")
+
+        // The engine reads this JSON, so the delay has to be on the wire.
+        let encoded = try JSONEncoder().encode(store.rules)
+        let wire = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [[String: Any]]
+        )
+        XCTAssertEqual(wire.first?["delayMilliseconds"] as? Int, 800)
+
+        // Mappings written before throttling existed carry no delay key.
+        var legacy = try XCTUnwrap(wire.first)
+        legacy.removeValue(forKey: "delayMilliseconds")
+        let legacyData = try JSONSerialization.data(withJSONObject: [legacy])
+        let decoded = try JSONDecoder().decode([MappingRule].self, from: legacyData)
+        XCTAssertEqual(decoded.first?.id, ruleID)
+        XCTAssertEqual(decoded.first?.delayMilliseconds, 0)
+    }
+
+    func testMappingStoreClampsDelaysThatReachTheEngine() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("mappings.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = MappingStore(fileURL: fileURL)
+        let id = store.addBlank(behavior: .localResponse)
+        guard var rule = store.rules.first else { return XCTFail("Expected a blank rule") }
+
+        rule.delayMilliseconds = -500
+        store.update(rule)
+        XCTAssertEqual(store.rules.first?.delayMilliseconds, 0)
+
+        rule.delayMilliseconds = NetworkProfile.maximumDelayMilliseconds * 10
+        store.update(rule)
+        XCTAssertEqual(store.rules.first?.delayMilliseconds, NetworkProfile.maximumDelayMilliseconds)
+
+        var added = rule
+        added.id = UUID()
+        added.delayMilliseconds = 900_000
+        let addedID = store.add(added)
+        XCTAssertNotEqual(addedID, id)
+        XCTAssertEqual(
+            store.rules.first { $0.id == addedID }?.delayMilliseconds,
+            NetworkProfile.maximumDelayMilliseconds
+        )
+    }
+
+    func testMappingEditorDraftClampsTheDelayItPrepares() {
+        let rule = MappingRule(
+            id: UUID(),
+            name: "Throttled",
+            enabled: true,
+            order: 0,
+            method: "get",
+            scheme: "https",
+            host: "api.example",
+            port: 443,
+            path: "v1/items",
+            matchQuery: false,
+            query: nil,
+            statusCode: 200,
+            responseHeaders: [],
+            responseBody: .empty,
+            sourceFlowID: nil,
+            delayMilliseconds: 250
+        )
+        var draft = MappingEditorDraft(rule: rule)
+        XCTAssertEqual(draft.preparedRule.delayMilliseconds, 250)
+
+        draft.rule.delayMilliseconds = NetworkProfile.maximumDelayMilliseconds + 5_000
+        XCTAssertEqual(draft.preparedRule.delayMilliseconds, NetworkProfile.maximumDelayMilliseconds)
+        XCTAssertEqual(draft.preparedRule.method, "GET")
+        XCTAssertEqual(draft.preparedRule.path, "/v1/items")
+    }
+
     func testHeaderRewriteDoesNotFreezeCapturedRequestBody() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let fileURL = directory.appendingPathComponent("mappings.json")

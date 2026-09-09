@@ -54,7 +54,7 @@ Use `deviceId`, `host`, `method`, `scheme`, `kind`, `search`, `limit`, and opaqu
 
 ## Mapping revisions
 
-Read the mapping collection and retain its `ETag`. Send that value in `If-Match` when updating, deleting, enabling, duplicating, or reordering. On HTTP 412, fetch the collection again and rebuild the intended change. Mapping paths are exact unless they contain `*`; each `*` matches zero or more path characters, including `/`. Query matching remains controlled separately by `matchQuery`. First enabled matching rule of each behavior wins.
+Read the mapping collection and retain its `ETag`. Send that value in `If-Match` when updating, deleting, enabling, duplicating, or reordering. On HTTP 412, fetch the collection again and rebuild the intended change. Mapping paths are exact unless they contain `*`; each `*` matches zero or more path characters, including `/`. Query matching remains controlled separately by `matchQuery`. First enabled matching rule of each behavior wins. Each rule also carries `delayMilliseconds`, the simulated network delay Lens adds before answering or forwarding a matched request; it defaults to 0 and is clamped to 60000.
 
 ## Confirmations
 
