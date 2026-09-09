@@ -33,6 +33,15 @@ struct MappingManagerView: View {
                                     Image(systemName: rule.behavior.systemImage)
                                         .foregroundStyle(rule.behavior == .rewriteRequest ? .blue : .orange)
                                     Text(rule.name).lineLimit(1)
+                                    if let delaySummary = rule.delaySummary {
+                                        Label(delaySummary, systemImage: "tortoise")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(.quaternary, in: Capsule())
+                                            .fixedSize()
+                                    }
                                 }
                                 Text(rule.matchSummary)
                                     .font(.caption2.monospaced())
@@ -168,6 +177,7 @@ struct MappingEditorDraft: Equatable {
         }
         result.method = result.method.uppercased()
         if !result.path.hasPrefix("/") { result.path = "/" + result.path }
+        result.delayMilliseconds = NetworkProfile.clampDelay(result.delayMilliseconds)
         return result
     }
 }
@@ -179,6 +189,18 @@ private struct MappingEditorView: View {
     init(rule: MappingRule, onDraftChange: @escaping (MappingRule) -> Void) {
         _editor = State(initialValue: MappingEditorDraft(rule: rule))
         self.onDraftChange = onDraftChange
+    }
+
+    /// The delay is the stored value; the preset is derived from it. Choosing a
+    /// preset writes its delay, and typing any other delay shows as Custom.
+    private var networkProfile: Binding<NetworkProfile?> {
+        Binding(
+            get: { editor.rule.networkProfile },
+            set: { profile in
+                guard let profile else { return }
+                editor.rule.delayMilliseconds = profile.delayMilliseconds
+            }
+        )
     }
 
     var body: some View {
@@ -212,6 +234,36 @@ private struct MappingEditorView: View {
                 Toggle("Match query parameters", isOn: $editor.rule.matchQuery)
                 if editor.rule.matchQuery {
                     TextField("Query", text: Binding($editor.rule.query, replacingNilWith: ""))
+                }
+                LabeledContent("Network") {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 8) {
+                            Picker("Network", selection: networkProfile) {
+                                ForEach(NetworkProfile.allCases) { profile in
+                                    Text(profile.title).tag(NetworkProfile?.some(profile))
+                                }
+                                if editor.rule.networkProfile == nil {
+                                    Text("Custom").tag(NetworkProfile?.none)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 150)
+                            .accessibilityLabel("Simulated network")
+                            TextField(
+                                "Delay",
+                                value: $editor.rule.delayMilliseconds,
+                                format: .number
+                            )
+                            .frame(width: 70)
+                            .labelsHidden()
+                            .accessibilityLabel("Added delay in milliseconds")
+                            Text("ms")
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("Holds every matching request this long before the client sees a response, up to \(NetworkProfile.maximumDelayMilliseconds) ms. Pick a preset or type your own delay.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 if editor.rule.behavior == .localResponse {
                     TextField("Response status", value: $editor.rule.statusCode, format: .number)

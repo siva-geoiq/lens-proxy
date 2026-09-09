@@ -134,6 +134,8 @@ private struct MessageInspector: View {
     let isFullscreen: Bool
     let toggleFullscreen: () -> Void
     @State private var editedRuleID: UUID?
+    /// Tree edits awaiting a Save, kept here so they survive a tab switch.
+    @State private var treeDraft: JSONValue?
     @State private var isSearchVisible = false
     @State private var searchTerm = ""
     @State private var activeMatch = 0
@@ -320,10 +322,12 @@ private struct MessageInspector: View {
 
                 JSONTreeEditorView(
                     data: treeBodyData,
+                    draft: $treeDraft,
                     isEditable: true,
                     editingDescription: mappingBehavior == .rewriteRequest
-                        ? "Edit any value to create or update a Request Rewrite. Future matches are modified before reaching the server."
-                        : "Edit any value to create or update this response's Local Mapping."
+                        ? "Edit any value, then Save to create or update a Request Rewrite. Future matches are modified before reaching the server."
+                        : "Edit any value, then Save to create or update this response's Local Mapping.",
+                    saveTitle: treeSaveTitle
                 ) { json in
                     switch mappingBehavior {
                     case .rewriteRequest:
@@ -342,12 +346,28 @@ private struct MessageInspector: View {
         }
     }
 
+    /// Names the rule the Save button will write, so the first edit reads as
+    /// creating a mapping rather than saving one that does not exist yet.
+    private var treeSaveTitle: String {
+        if activeRuleID != nil { return "Save" }
+        return mappingBehavior == .rewriteRequest ? "Create Rewrite" : "Create Mapping"
+    }
+
+    /// The rule this pane's edits belong to, resolved the same way MappingStore
+    /// resolves it so the banner, the Save button and the saved rule agree. A rule
+    /// named by the capture may since have been deleted, so only identifiers that
+    /// still resolve are used.
     private var activeRuleID: UUID? {
-        if let editedRuleID { return editedRuleID }
+        let rules = model.mappings.rules
+        if let editedRuleID, rules.contains(where: { $0.id == editedRuleID }) {
+            return editedRuleID
+        }
         let capturedRuleID = mappingBehavior == .rewriteRequest ? flow.rewrittenRuleID : flow.mappedRuleID
-        return capturedRuleID ?? model.mappings.rules.first(where: {
-            $0.sourceFlowID == flow.id && $0.behavior == mappingBehavior
-        })?.id
+        if let capturedRuleID,
+           rules.contains(where: { $0.id == capturedRuleID && $0.behavior == mappingBehavior }) {
+            return capturedRuleID
+        }
+        return rules.first { $0.sourceFlowID == flow.id && $0.behavior == mappingBehavior }?.id
     }
 
     private var treeBodyData: Data {

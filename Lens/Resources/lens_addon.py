@@ -16,6 +16,9 @@ MAX_BODY_BYTES = 10 * 1024 * 1024
 # 64 KiB default. Keep an explicit upper bound and report larger commands without
 # dropping the authenticated control connection.
 MAX_CONTROL_MESSAGE_BYTES = 64 * 1024 * 1024
+# A delayed request holds its connection for the whole wait. Mirror the cap the
+# Lens editor enforces so a malformed rule cannot pin connections open.
+MAX_DELAY_SECONDS = 60.0
 
 
 def path_matches(pattern, request_path):
@@ -23,6 +26,17 @@ def path_matches(pattern, request_path):
         return pattern == request_path
     expression = re.escape(pattern).replace(r"\*", ".*")
     return re.fullmatch(expression, request_path) is not None
+
+
+def rule_delay_seconds(rule):
+    """Simulated network delay for a matched rule, in seconds."""
+    if not rule:
+        return 0.0
+    try:
+        milliseconds = int(rule.get("delayMilliseconds") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(milliseconds / 1000.0, MAX_DELAY_SECONDS))
 
 
 class LensAddon:
@@ -55,10 +69,20 @@ class LensAddon:
             self.server.close()
             await self.server.wait_closed()
 
-    def request(self, flow: http.HTTPFlow):
+    async def request(self, flow: http.HTTPFlow):
         self.remove_conditional_cache_headers(flow)
-        self.apply_request_rewrite(flow)
-        self.apply_response_mapping(flow)
+        rewrite_rule = self.apply_request_rewrite(flow)
+        mapping_rule = next(self.matching_rules(flow, "localResponse"), None)
+        self.flows[flow.id] = flow
+        delay = max(rule_delay_seconds(rewrite_rule), rule_delay_seconds(mapping_rule))
+        if delay > 0:
+            # Show the request while it is held so a throttled flow reads as
+            # in-flight rather than as a stalled proxy, then answer it late so
+            # the reported duration includes the simulated network delay.
+            self.emit_flow(flow)
+            await asyncio.sleep(delay)
+        if mapping_rule is not None:
+            self.apply_response_mapping(flow, mapping_rule)
         self.flows[flow.id] = flow
         self.emit_flow(flow)
 
@@ -205,6 +229,7 @@ class LensAddon:
             yield rule
 
     def apply_request_rewrite(self, flow: http.HTTPFlow):
+        """Applies the first matching rewrite and returns it, or None."""
         request = flow.request
         for rule in self.matching_rules(flow, "rewriteRequest"):
             rewrite_body = bool(rule.get("rewriteBody", False))
@@ -226,21 +251,20 @@ class LensAddon:
                 request.content = body_data
             flow.metadata["lens_rewrite_id"] = rule.get("id")
             flow.metadata["lens_rewrite_name"] = rule.get("name")
-            break
+            return rule
+        return None
 
-    def apply_response_mapping(self, flow: http.HTTPFlow):
-        for rule in self.matching_rules(flow, "localResponse"):
-            body = rule.get("responseBody") or {}
-            body_data = base64.b64decode(body.get("data", ""))
-            headers = http.Headers([
-                (item.get("name", "").encode("latin-1"), item.get("value", "").encode("latin-1"))
-                for item in rule.get("responseHeaders", [])
-                if item.get("name")
-            ])
-            flow.response = http.Response.make(int(rule.get("statusCode", 200)), body_data, headers)
-            flow.metadata["lens_mapping_id"] = rule.get("id")
-            flow.metadata["lens_mapping_name"] = rule.get("name")
-            break
+    def apply_response_mapping(self, flow: http.HTTPFlow, rule):
+        body = rule.get("responseBody") or {}
+        body_data = base64.b64decode(body.get("data", ""))
+        headers = http.Headers([
+            (item.get("name", "").encode("latin-1"), item.get("value", "").encode("latin-1"))
+            for item in rule.get("responseHeaders", [])
+            if item.get("name")
+        ])
+        flow.response = http.Response.make(int(rule.get("statusCode", 200)), body_data, headers)
+        flow.metadata["lens_mapping_id"] = rule.get("id")
+        flow.metadata["lens_mapping_name"] = rule.get("name")
 
     def emit_flow(self, flow):
         if not self.capture_enabled:

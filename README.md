@@ -20,6 +20,22 @@ Simulator traffic and the Mac's own traffic both arrive from `127.0.0.1`, so Len
 
 Shared Preferences and Deep Inspection work through ADB and remain Android-only; the corresponding API routes reject an iOS serial with `android_only`.
 
+## Local mappings
+
+A mapping either answers a request from Lens (**Local Response**) or edits it on its way upstream (**Request Rewrite**). Editing a value in a flow's **Tree** tab stages the change; **Save** writes it to the mapping the flow came from, creating one on the first save and updating that same rule afterwards.
+
+Each rule also carries a simulated network delay, chosen from a dropdown of presets or typed in milliseconds:
+
+| Preset | Added delay |
+| --- | --- |
+| No delay | 0 ms |
+| 5G | 30 ms |
+| 4G LTE | 100 ms |
+| 3G | 300 ms |
+| 2G EDGE | 800 ms |
+
+Lens shapes latency, not bandwidth: it holds every matching request for the delay before the client sees a response, up to 60 seconds. Held requests do not block each other, so several throttled flows run in parallel. To slow an endpoint without changing what it returns, create a Request Rewrite that replaces neither the headers nor the body and set only the delay.
+
 ## Install the unsigned release
 
 Lens currently uses an ad-hoc signature and is not notarized by Apple. Download the DMG and its matching SHA-256 file from the [GitHub Releases page](https://github.com/siva-geoiq/lens-proxy/releases/latest), place both files in the same directory, and verify the download:

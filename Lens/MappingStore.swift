@@ -43,9 +43,8 @@ final class MappingStore {
     }
 
     func createRequestRewrite(from flow: FlowRecord) -> UUID {
-        if let existingID = flow.rewrittenRuleID ?? rules.first(where: {
-            $0.sourceFlowID == flow.id && $0.behavior == .rewriteRequest
-        })?.id {
+        if let index = existingRuleIndex(for: flow, behavior: .rewriteRequest) {
+            let existingID = rules[index].id
             selectedRuleID = existingID
             return existingID
         }
@@ -58,9 +57,8 @@ final class MappingStore {
     }
 
     func createRequestHeaderRewrite(from flow: FlowRecord) -> UUID {
-        if let existingID = flow.rewrittenRuleID ?? rules.first(where: {
-            $0.sourceFlowID == flow.id && $0.behavior == .rewriteRequest
-        })?.id {
+        if let index = existingRuleIndex(for: flow, behavior: .rewriteRequest) {
+            let existingID = rules[index].id
             selectedRuleID = existingID
             return existingID
         }
@@ -73,16 +71,28 @@ final class MappingStore {
         return rule.id
     }
 
+    /// Finds the rule a flow's edits belong to.
+    ///
+    /// A captured flow names the rule that served it, but that rule may since have
+    /// been deleted. Falling back to the flow that created a rule keeps every edit
+    /// on one rule instead of leaving a stale identifier to spawn a duplicate for
+    /// each change.
+    private func existingRuleIndex(for flow: FlowRecord, behavior: MappingBehavior) -> Int? {
+        let capturedRuleID = behavior == .rewriteRequest ? flow.rewrittenRuleID : flow.mappedRuleID
+        if let capturedRuleID,
+           let index = rules.firstIndex(where: { $0.id == capturedRuleID && $0.behavior == behavior }) {
+            return index
+        }
+        return rules.firstIndex { $0.sourceFlowID == flow.id && $0.behavior == behavior }
+    }
+
     /// Creates a local response mapping for a captured flow, or updates the
     /// mapping that produced it. This keeps repeated Tree edits attached to a
     /// single rule instead of adding a new mock for every field change.
     func upsertResponseBody(_ responseBody: BodyPayload, from flow: FlowRecord) -> UUID {
-        let existingID = flow.mappedRuleID ?? rules.first(where: {
-            $0.sourceFlowID == flow.id && $0.behavior == .localResponse
-        })?.id
-        if let existingID,
-           let index = rules.firstIndex(where: { $0.id == existingID }) {
+        if let index = existingRuleIndex(for: flow, behavior: .localResponse) {
             rules[index].responseBody = responseBody
+            let existingID = rules[index].id
             selectedRuleID = existingID
             persistAndNotify()
             return existingID
@@ -100,14 +110,11 @@ final class MappingStore {
     /// rewrite that produced it. Tree edits rewrite only the body so unrelated
     /// dynamic headers continue to pass through unchanged.
     func upsertRequestBody(_ requestBody: BodyPayload, from flow: FlowRecord) -> UUID {
-        let existingID = flow.rewrittenRuleID ?? rules.first(where: {
-            $0.sourceFlowID == flow.id && $0.behavior == .rewriteRequest
-        })?.id
-        if let existingID,
-           let index = rules.firstIndex(where: { $0.id == existingID }) {
+        if let index = existingRuleIndex(for: flow, behavior: .rewriteRequest) {
             rules[index].behavior = .rewriteRequest
             rules[index].rewriteBody = true
             rules[index].requestBody = requestBody
+            let existingID = rules[index].id
             selectedRuleID = existingID
             persistAndNotify()
             return existingID
@@ -156,7 +163,7 @@ final class MappingStore {
 
     @discardableResult
     func add(_ rule: MappingRule) -> UUID {
-        var addedRule = rule
+        var addedRule = sanitized(rule)
         if rules.contains(where: { $0.id == addedRule.id }) {
             addedRule.id = UUID()
         }
@@ -169,8 +176,16 @@ final class MappingStore {
 
     func update(_ rule: MappingRule) {
         guard let index = rules.firstIndex(where: { $0.id == rule.id }) else { return }
-        rules[index] = rule
+        rules[index] = sanitized(rule)
         persistAndNotify()
+    }
+
+    /// Keeps values that reach the engine within the range it can honour, whether
+    /// they arrive from the editor or the automation API.
+    private func sanitized(_ rule: MappingRule) -> MappingRule {
+        var result = rule
+        result.delayMilliseconds = NetworkProfile.clampDelay(result.delayMilliseconds)
+        return result
     }
 
     func toggle(_ id: UUID) {

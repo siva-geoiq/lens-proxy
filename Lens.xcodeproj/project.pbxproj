@@ -205,11 +205,11 @@
 			);
 			mainGroup = 47347D483029D60000424932;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
-			productRefGroup = 47347D523029D60000424932 /* Products */;
 			packageReferences = (
 				D1000002302B000000424932 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 47347D523029D60000424932 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -269,7 +269,6 @@
 		};
 		C10000023029D60000424932 /* Embed Android Platform Tools */ = {
 			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 0;
 			buildActionMask = 2147483647;
 			files = (
 			);
@@ -293,7 +292,6 @@
 		};
 		C10000033029D60000424932 /* Embed Android Inspector Agent */ = {
 			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 0;
 			buildActionMask = 2147483647;
 			files = (
 			);
@@ -422,7 +420,7 @@
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -485,7 +483,7 @@
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -517,13 +515,14 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Configuration/Lens-Info.plist;
+				INFOPLIST_FILE = "Configuration/Lens-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
 				LENS_UPDATE_FEED_URL = "";
+				MARKETING_VERSION = 1.0;
+				OTHER_CODE_SIGN_FLAGS = "--deep";
 				PRODUCT_BUNDLE_IDENTIFIER = com.lenskart.lens.Lens;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -541,8 +540,8 @@
 				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = lens_icon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_STYLE = Automatic;
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
@@ -550,13 +549,14 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Configuration/Lens-Info.plist;
+				INFOPLIST_FILE = "Configuration/Lens-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
 				LENS_UPDATE_FEED_URL = "https://github.com/siva-geoiq/lens-proxy/releases/latest/download/appcast.xml";
+				MARKETING_VERSION = 1.0;
+				OTHER_CODE_SIGN_FLAGS = "--deep";
 				PRODUCT_BUNDLE_IDENTIFIER = com.lenskart.lens.Lens;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;

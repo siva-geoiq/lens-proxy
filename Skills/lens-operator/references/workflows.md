@@ -25,6 +25,12 @@ Use `*` in the mapping path to cover a family of endpoints. For example, `/v2/pr
 
 Create a mapping with `{"behavior":"rewriteRequest"}`. Set `rewriteHeaders` and/or `rewriteBody`; leave either false to pass that portion through unchanged. Trigger a fresh device request because rewrites apply before upstream transmission, not retroactively.
 
+## Simulate a slow network
+
+Set `delayMilliseconds` on any mapping rule. Lens holds each matching request for that long before the client sees a response, so the rule's behavior decides where the wait lands: a `localResponse` rule answers late, and a `rewriteRequest` rule forwards upstream late. Values are capped at 60000 ms and clamped on write.
+
+The presets the Lens editor offers are 0 (no delay), 30 (5G), 100 (4G LTE), 300 (3G) and 800 (2G EDGE); any other value is accepted and shows as Custom. To throttle an endpoint without changing its payload, create a `rewriteRequest` mapping with `rewriteHeaders` and `rewriteBody` both false and only `delayMilliseconds` set.
+
 ## Firebase Remote Config
 
 Enable `removeConditionalHeaders` through `/v1/capture/options` before triggering the fetch. Search for `firebaseremoteconfig.googleapis.com` and `firebase:fetch`. A `NO_CHANGE` response usually indicates server/cache behavior; use a local response mapping to return a complete Firebase fetch response when testing configuration changes.
